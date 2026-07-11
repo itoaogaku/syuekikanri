@@ -1,0 +1,12 @@
+# clasp
+.clasp.json
+.clasprc.json
+
+# 機密情報は絶対にコミットしない
+*.key
+secrets*
+.env
+
+# OS / editor
+.DS_Store
+node_modules/
