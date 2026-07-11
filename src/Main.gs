@@ -1,38 +1,42 @@
 /**
  * Main.gs
  * -----------------------------------------------------------------------------
- * エントリポイント。メニュー、月次実行、トリガー設定、APIキー設定。
+ * エントリポイント。メニュー、月次取得（台帳へ蓄積）、レポート再生成、
+ * トリガー設定、APIキー設定。
+ *
+ * 流れ:
+ *   月次実行 → その月の取引を取得 → 台帳（明細DB/入金DB）へ追記・更新
+ *          → 台帳全体から 年度サマリー・事業別・商品別・決済手段別・入金照合 を再生成
  */
 
-/** スプレッドシートを開いたときにメニューを追加 */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('売上レポート')
-    .addItem('① APIキーを設定', 'setupApiKeys')
+    .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
+    .addItem('② 事業マッピングを編集', 'openMappingSheet')
     .addSeparator()
-    .addItem('② 先月のレポートを作成', 'runLastMonthReport')
-    .addItem('③ 月を指定してレポート作成', 'runReportForChosenMonth')
+    .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
+    .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
+    .addItem('⑤ レポートを再作成（取得済みデータから）', 'regenerateReports')
     .addSeparator()
-    .addItem('④ 毎月の自動作成をON（毎月5日）', 'createMonthlyTrigger')
-    .addItem('　 自動作成をOFF', 'deleteMonthlyTrigger')
+    .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
+    .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
     .addSeparator()
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
 
-/** 先月分（前月1日〜末日）のレポートを作成 */
+/** 先月分を取得して台帳へ反映 */
 function runLastMonthReport() {
   const now = new Date();
-  const y = now.getFullYear();
-  const m = now.getMonth(); // 0-indexed。0 のとき前月は前年12月
-  const target = new Date(y, m - 1, 1); // 先月の1日
+  const target = new Date(now.getFullYear(), now.getMonth() - 1, 1); // 先月の1日
   runReportForMonth_(target.getFullYear(), target.getMonth() + 1);
 }
 
-/** ダイアログで年月を指定して作成 */
+/** 年月を指定して取得 */
 function runReportForChosenMonth() {
   const ui = SpreadsheetApp.getUi();
-  const res = ui.prompt('レポート作成', '対象の年月を入力（例: 2026-06）', ui.ButtonSet.OK_CANCEL);
+  const res = ui.prompt('データ取得', '対象の年月を入力（例: 2026-06）', ui.ButtonSet.OK_CANCEL);
   if (res.getSelectedButton() !== ui.Button.OK) return;
   const m = String(res.getResponseText()).match(/^(\d{4})[-\/](\d{1,2})$/);
   if (!m) { ui.alert('形式が不正です。例: 2026-06'); return; }
@@ -40,77 +44,103 @@ function runReportForChosenMonth() {
 }
 
 /**
- * 指定した年月（1-indexed）のレポートを作成する本体。
- * @param {number} year
- * @param {number} month1
+ * 指定した年月のデータを取得して台帳へ upsert し、全レポートを再生成。
  */
 function runReportForMonth_(year, month1) {
-  const tz = 'Asia/Tokyo';
   const from = new Date(year, month1 - 1, 1, 0, 0, 0);
-  const to = new Date(year, month1, 0, 23, 59, 59); // 当月末日
-  const periodLabel = Utilities.formatDate(from, tz, 'yyyy年M月');
-
+  const to = new Date(year, month1, 0, 23, 59, 59);
+  const yearMonth = Utilities.formatDate(from, 'Asia/Tokyo', 'yyyy-MM');
   const gteUnix = Math.floor(from.getTime() / 1000);
   const lteUnix = Math.floor(to.getTime() / 1000);
 
   if (!isStripeEnabled_() && !isKomojuEnabled_()) {
-    SpreadsheetApp.getUi().alert('APIキーが未設定です。メニュー「① APIキーを設定」から入力してください。');
+    SpreadsheetApp.getUi().alert('APIキーが未設定です。メニュー「①」から入力してください。');
     return;
   }
 
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   let txns = [];
-  let stripePayouts = [];
+  let payouts = [];
+  const fetchedSources = [];
 
   if (isStripeEnabled_()) {
     const s = stripeCollect_(gteUnix, lteUnix);
     txns = txns.concat(s.txns);
-    stripePayouts = stripePayouts.concat(s.payouts);
+    payouts = payouts.concat(s.payouts);
+    fetchedSources.push('Stripe');
   }
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(from, to);
     txns = txns.concat(k.txns);
+    fetchedSources.push('Komoju');
   }
 
-  const agg = aggregate_(txns, stripePayouts);
-  writeReport_(agg, periodLabel);
+  // 台帳へ蓄積（その月・そのサービス分を入れ替え）
+  upsertLedger_(ss, txns, yearMonth, fetchedSources);
+  upsertPayoutLedger_(ss, payouts, yearMonth, fetchedSources);
 
-  SpreadsheetApp.getActiveSpreadsheet().toast(
-    periodLabel + 'のレポートを作成しました（取引 ' + txns.length + ' 件）', '完了', 5);
+  regenerateReports();
+
+  ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
 }
 
-/** APIキーをダイアログで設定 */
+/** 台帳（取得済みデータ）から全レポートを再生成。事業マッピング変更後などに使う。 */
+function regenerateReports() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const txns = readLedger_(ss);
+  const payouts = readPayoutLedger_(ss);
+  const rules = loadBusinessRules_(ss);
+  const reports = buildReports_(txns, rules, payouts);
+  writeAllReports_(ss, reports);
+  ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/** 事業マッピングシートを開く（無ければ作成） */
+function openMappingSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ensureMappingSheet_(ss);
+  ss.setActiveSheet(sh);
+  SpreadsheetApp.getUi().alert('「事業マッピング」シートで、キーワードと事業名を編集してください。\n編集後は「⑤ レポートを再作成」で反映されます。');
+}
+
+/** APIキーと年度開始月を設定 */
 function setupApiKeys() {
   const ui = SpreadsheetApp.getUi();
   const props = PropertiesService.getScriptProperties();
 
   const stripe = ui.prompt('Stripe',
-    'Stripe のシークレットキー（sk_...）を入力。使わない場合は空でOK。\n※読み取り専用の制限キー推奨。',
+    'Stripe のシークレットキー（sk_...）を入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
-  if (stripe.getSelectedButton() === ui.Button.OK) {
-    const v = stripe.getResponseText().trim();
-    if (v) props.setProperty(PROP_KEYS.STRIPE_SECRET, v);
+  if (stripe.getSelectedButton() === ui.Button.OK && stripe.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.STRIPE_SECRET, stripe.getResponseText().trim());
   }
 
   const komoju = ui.prompt('Komoju',
-    'Komoju のシークレットキーを入力。使わない場合は空でOK。',
+    'Komoju のシークレットキーを入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
-  if (komoju.getSelectedButton() === ui.Button.OK) {
-    const v = komoju.getResponseText().trim();
-    if (v) props.setProperty(PROP_KEYS.KOMOJU_SECRET, v);
+  if (komoju.getSelectedButton() === ui.Button.OK && komoju.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.KOMOJU_SECRET, komoju.getResponseText().trim());
   }
 
   const rate = ui.prompt('Komoju 手数料率（概算用）',
-    'Komoju の決済手数料率を入力（例: 3.65% なら 0.0365）。空なら 0。',
+    'Komoju の決済手数料率（例: 3.65% → 0.0365）。変更しない場合は空。',
     ui.ButtonSet.OK_CANCEL);
-  if (rate.getSelectedButton() === ui.Button.OK) {
-    const v = rate.getResponseText().trim();
-    if (v) props.setProperty(PROP_KEYS.KOMOJU_FEE_RATE, v);
+  if (rate.getSelectedButton() === ui.Button.OK && rate.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.KOMOJU_FEE_RATE, rate.getResponseText().trim());
   }
 
-  ui.alert('APIキーを保存しました。');
+  const fiscal = ui.prompt('年度の開始月',
+    '会計年度の開始月を 1〜12 で入力（例: 4月始まり→ 4、暦年→ 1）。既定は 4。変更しない場合は空。',
+    ui.ButtonSet.OK_CANCEL);
+  if (fiscal.getSelectedButton() === ui.Button.OK && fiscal.getResponseText().trim()) {
+    const n = parseInt(fiscal.getResponseText().trim(), 10);
+    if (n >= 1 && n <= 12) props.setProperty(PROP_KEYS.FISCAL_START, String(n));
+  }
+
+  ui.alert('設定を保存しました。');
 }
 
-/** 毎月5日 午前9時台に前月分を自動作成するトリガーを設定 */
+/** 毎月5日 午前9時台に前月分を自動取得するトリガー */
 function createMonthlyTrigger() {
   deleteMonthlyTrigger();
   ScriptApp.newTrigger('runLastMonthReport')
@@ -119,10 +149,9 @@ function createMonthlyTrigger() {
     .atHour(9)
     .inTimezone('Asia/Tokyo')
     .create();
-  SpreadsheetApp.getUi().alert('毎月5日 9時台に、前月分のレポートを自動作成します。');
+  SpreadsheetApp.getUi().alert('毎月5日 9時台に、前月分を自動取得して台帳へ反映します。');
 }
 
-/** 自動作成トリガーを削除 */
 function deleteMonthlyTrigger() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'runLastMonthReport') ScriptApp.deleteTrigger(t);

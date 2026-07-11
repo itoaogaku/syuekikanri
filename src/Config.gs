@@ -9,11 +9,14 @@
 
 /** シート名の定義（必要なら日本語名を変更してOK） */
 const SHEETS = {
-  SUMMARY: 'サマリー',          // ①手数料・返金 ②入金照合 ③決済手段別 のまとめ
-  BY_PRODUCT: '商品別売上',      // 商品別の集計
-  BY_METHOD: '決済手段別',       // 決済手段（カード/コンビニ等）別の集計
+  ANNUAL: '年度サマリー',        // 年度ごとの Stripe/Komoju 合計
+  BY_BUSINESS: '事業別サマリー',  // 年度ごと・事業ごとの入金
+  BY_PRODUCT: '商品別売上',      // 年度ごと・商品別の集計
+  BY_METHOD: '決済手段別',       // 年度ごと・決済手段別の集計
   RECONCILE: '入金照合',         // 入金額（振込）との照合・検算
-  DETAIL: '明細',               // 取得した全取引の明細（元データ）
+  LEDGER: '明細DB',             // ★全取引を蓄積する台帳（元データ・年間で追記されていく）
+  PAYOUTS: '入金DB',            // ★入金(payout)を蓄積する台帳
+  MAPPING: '事業マッピング',      // キーワード→事業名 の対応表（ユーザーが編集）
 };
 
 /** スクリプトプロパティのキー名 */
@@ -21,6 +24,7 @@ const PROP_KEYS = {
   STRIPE_SECRET: 'STRIPE_SECRET_KEY',   // 例: sk_live_xxx（読み取り専用の制限キー推奨）
   KOMOJU_SECRET: 'KOMOJU_SECRET_KEY',   // Komoju のシークレットキー
   KOMOJU_FEE_RATE: 'KOMOJU_FEE_RATE',   // Komoju の手数料率（例 "0.0365" = 3.65%）※純額の概算用
+  FISCAL_START: 'FISCAL_YEAR_START_MONTH', // 年度の開始月（1〜12）。既定は 4（4月始まり）
 };
 
 /** 通貨設定。日本円は補助単位なし（amount がそのまま円）。 */

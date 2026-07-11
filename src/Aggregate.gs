@@ -1,78 +1,112 @@
 /**
  * Aggregate.gs
  * -----------------------------------------------------------------------------
- * 正規化済みの取引明細（Stripe + Komoju）を、報告用の各集計に変換する。
+ * 台帳（全取引）から、年度ごと・事業ごと・決済ごとの集計を作る。
  *
  * 生成する集計:
- *   1. byProduct  : 商品別の売上（件数・総額・返金・純額）
- *   2. byMethod   : 決済手段別の内訳
- *   3. totals     : 手数料・返金の全体内訳
- *   4. reconcile  : 入金額（振込）との照合（Stripe payout 単位）
+ *   1. annual    : 年度ごとの Stripe/Komoju 合計（＋月別推移）
+ *   2. business  : 年度ごと・事業ごとの入金
+ *   3. byProduct : 年度ごと・商品別
+ *   4. byMethod  : 年度ごと・決済手段別
+ *   5. reconcile : 入金(payout)との照合
  */
 
+/** 空の集計オブジェクト */
+function emptyAgg_() {
+  return { gross: 0, refund: 0, fee: 0, net: 0, count: 0 };
+}
+function addTxn_(acc, t) {
+  if (t.kind === 'sale') { acc.gross += t.gross; acc.count += 1; }
+  else if (t.kind === 'refund') { acc.refund += -t.gross; } // gross は負値
+  acc.fee += t.fee;
+  acc.net += t.net;
+}
+
 /**
- * @param {Array<Object>} txns 正規化済み明細
- * @param {Array<Object>} stripePayouts Stripe の payout サマリー
+ * 台帳の全取引 + ルール + 入金台帳から、全レポート用データを作る。
+ * @param {Array<Object>} txns
+ * @param {Array<Object>} rules 事業振り分けルール
+ * @param {Array<Object>} payouts 入金台帳
  * @return {Object}
  */
-function aggregate_(txns, stripePayouts) {
+function buildReports_(txns, rules, payouts) {
+  // 各取引に年度と事業を付与
+  txns.forEach(function (t) {
+    t.fy = fiscalYearOf_(t.date);
+    t.business = classifyBusiness_(t, rules);
+  });
+
+  const fySet = {};
+  txns.forEach(function (t) { fySet[t.fy] = true; });
+  const fyList = Object.keys(fySet).map(Number).sort(function (a, b) { return b - a; }); // 新しい年度が上
+
   return {
-    byProduct: aggByProduct_(txns),
-    byMethod: aggByMethod_(txns),
-    totals: aggTotals_(txns),
-    reconcile: stripePayouts || [],
-    txns: txns,
+    fyList: fyList,
+    annual: buildAnnual_(txns, fyList),
+    business: buildBusiness_(txns, fyList),
+    byProduct: buildByKey_(txns, fyList, function (t) { return t.source + ' / ' + t.product; }, 'product'),
+    byMethod: buildByKey_(txns, fyList, function (t) { return t.source + ' / ' + t.method; }, 'method'),
+    reconcile: payouts || [],
   };
 }
 
-/** 商品別集計 */
-function aggByProduct_(txns) {
-  const map = {};
-  txns.forEach(function (t) {
-    const key = t.source + ' / ' + t.product;
-    if (!map[key]) {
-      map[key] = {
-        source: t.source, product: t.product,
-        count: 0, gross: 0, refund: 0, fee: 0, net: 0,
-      };
-    }
-    const row = map[key];
-    if (t.kind === 'sale') { row.count += 1; row.gross += t.gross; }
-    else if (t.kind === 'refund') { row.refund += -t.gross; } // gross は負値なので符号反転
-    row.fee += t.fee;
-    row.net += t.net;
+/** 年度 × サービス（Stripe/Komoju）の合計＋会計月別の純額推移 */
+function buildAnnual_(txns, fyList) {
+  const out = {};
+  fyList.forEach(function (fy) {
+    out[fy] = {
+      bySource: {},                 // { Stripe: agg, Komoju: agg }
+      total: emptyAgg_(),
+      monthly: {},                  // { source: { month: net } }
+    };
   });
-  return Object.keys(map)
-    .map(function (k) { return map[k]; })
-    .sort(function (a, b) { return b.gross - a.gross; });
+  txns.forEach(function (t) {
+    const b = out[t.fy];
+    if (!b.bySource[t.source]) b.bySource[t.source] = emptyAgg_();
+    addTxn_(b.bySource[t.source], t);
+    addTxn_(b.total, t);
+    if (!b.monthly[t.source]) b.monthly[t.source] = {};
+    const m = t.date.getMonth() + 1;
+    b.monthly[t.source][m] = (b.monthly[t.source][m] || 0) + t.net;
+  });
+  return out;
 }
 
-/** 決済手段別集計 */
-function aggByMethod_(txns) {
-  const map = {};
+/** 年度 × 事業 の入金（純額）。サービス別の内訳も持つ */
+function buildBusiness_(txns, fyList) {
+  const out = {};
+  fyList.forEach(function (fy) { out[fy] = {}; });
   txns.forEach(function (t) {
-    const key = t.source + ' / ' + t.method;
-    if (!map[key]) {
-      map[key] = { source: t.source, method: t.method, count: 0, gross: 0, refund: 0, net: 0 };
+    const byBiz = out[t.fy];
+    if (!byBiz[t.business]) {
+      byBiz[t.business] = { total: emptyAgg_(), bySource: {} };
     }
-    const row = map[key];
-    if (t.kind === 'sale') { row.count += 1; row.gross += t.gross; }
-    else if (t.kind === 'refund') { row.refund += -t.gross; }
-    row.net += t.net;
+    const rec = byBiz[t.business];
+    addTxn_(rec.total, t);
+    if (!rec.bySource[t.source]) rec.bySource[t.source] = emptyAgg_();
+    addTxn_(rec.bySource[t.source], t);
   });
-  return Object.keys(map)
-    .map(function (k) { return map[k]; })
-    .sort(function (a, b) { return b.gross - a.gross; });
+  return out;
 }
 
-/** 全体の手数料・返金内訳 */
-function aggTotals_(txns) {
-  const t = { grossSales: 0, refunds: 0, fees: 0, net: 0, saleCount: 0, refundCount: 0 };
-  txns.forEach(function (x) {
-    if (x.kind === 'sale') { t.grossSales += x.gross; t.saleCount += 1; }
-    else if (x.kind === 'refund') { t.refunds += -x.gross; t.refundCount += 1; }
-    t.fees += x.fee;
-    t.net += x.net;
+/** 年度 × 任意キー（商品 or 決済手段）の集計 */
+function buildByKey_(txns, fyList, keyFn, labelField) {
+  const out = {};
+  fyList.forEach(function (fy) { out[fy] = {}; });
+  txns.forEach(function (t) {
+    const map = out[t.fy];
+    const key = keyFn(t);
+    if (!map[key]) {
+      map[key] = { source: t.source, label: t[labelField], agg: emptyAgg_() };
+    }
+    addTxn_(map[key].agg, t);
   });
-  return t;
+  // 各年度を配列（売上降順）に整形
+  const arr = {};
+  fyList.forEach(function (fy) {
+    arr[fy] = Object.keys(out[fy])
+      .map(function (k) { return out[fy][k]; })
+      .sort(function (a, b) { return b.agg.gross - a.agg.gross; });
+  });
+  return arr;
 }
