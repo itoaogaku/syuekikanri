@@ -26,6 +26,7 @@ function onOpen() {
     .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
     .addSeparator()
     .addItem('🔍 Komoju接続テスト', 'testKomoju')
+    .addItem('🔍 Komoju精算(入金)データを調べる（診断）', 'testKomojuSettlements')
     .addItem('🔍 Stripe接続テスト', 'testStripe')
     .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
@@ -246,6 +247,27 @@ function testKomoju() {
     ui.alert('Komoju 接続エラー ❌\n\n' + e.message +
       '\n\nキーの種類（非公開鍵か）・店舗が正しいかご確認ください。');
   }
+}
+
+/** Komojuの精算（入金/振込）データの入口を探して「Komoju精算診断」に書き出す。 */
+function testKomojuSettlements() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isKomojuEnabled_()) { ui.alert('Komojuのキーが未設定です。'); return; }
+  const results = komojuProbeSettlements_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName('Komoju精算診断');
+  if (!sh) sh = ss.insertSheet('Komoju精算診断');
+  sh.clear();
+  const header = ['パス', 'ステータス', '応答(先頭3500字)'];
+  sh.getRange(1, 1, 1, 3).setValues([header]).setFontWeight('bold');
+  const rows = results.map(function (r) { return [r.path, r.status, String(r.text).slice(0, 3500)]; });
+  sh.getRange(2, 1, rows.length, 3).setValues(rows);
+  ss.setActiveSheet(sh);
+  const ok = results.filter(function (r) { return r.status === 200; });
+  let msg = 'Komojuの精算データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
+  results.forEach(function (r) { msg += '・' + r.path + ' → ' + r.status + '\n'; });
+  msg += '\n詳しい応答は「Komoju精算診断」シートに書き出しました。共有ください。';
+  ui.alert(msg);
 }
 
 /** Stripe への接続確認。 */

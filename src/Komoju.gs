@@ -23,6 +23,37 @@ function komojuHeaders_() {
   return { Authorization: 'Basic ' + Utilities.base64Encode(key + ':') };
 }
 
+/** 任意の Komoju エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
+function komojuTry_(method, path) {
+  try {
+    const res = UrlFetchApp.fetch(KOMOJU_BASE + path, {
+      method: method, headers: komojuHeaders_(), muteHttpExceptions: true,
+    });
+    return { status: res.getResponseCode(), text: res.getContentText() };
+  } catch (e) {
+    return { status: -1, text: String(e) };
+  }
+}
+
+/** Komojuの精算（入金/振込）データの入口を探す。診断用。 */
+function komojuProbeSettlements_() {
+  const paths = [
+    '/settlements?limit=3',
+    '/payouts?limit=3',
+    '/deposits?limit=3',
+    '/statements?limit=3',
+    '/transfers?limit=3',
+    '/settlement?limit=3',
+    '/merchant_settlements?limit=3',
+    '/settlements',
+    '/payouts',
+  ];
+  return paths.map(function (p) {
+    const r = komojuTry_('get', p);
+    return { path: p, status: r.status, text: r.text };
+  });
+}
+
 /**
  * 期間内の Komoju 決済を取得して正規化。
  * created_at で period に入るものだけを対象にする（クライアント側フィルタ）。
