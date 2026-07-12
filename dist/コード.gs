@@ -1629,6 +1629,7 @@ function onOpen() {
     .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
     .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
     .addItem('🔍 Wix支払い/フォームを調べる（診断）', 'testWixPayments')
+    .addItem('🔍 Wix取引とKomojuを並べる（診断）', 'dumpWixTransactions')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
@@ -1934,6 +1935,65 @@ function regenerateReports() {
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/** Wixの支払いデータとKomoju明細を並べて「Wix取引診断」に書き出す（原因調査用）。 */
+function dumpWixTransactions() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1ページ目を生取得（ページ送りの構造も見る）
+  const r = wixTry_('get', '/payments/v2/transactions?cursorPaging.limit=100', null);
+  let j = {};
+  try { j = JSON.parse(r.text); } catch (e) { }
+  const txs = j.transactions || [];
+  const meta = j.pagingMetadata || j.metadata || {};
+
+  // 台帳のKomoju明細も取得
+  const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
+
+  let sh = ss.getSheetByName('Wix取引診断');
+  if (!sh) sh = ss.insertSheet('Wix取引診断');
+  sh.clear();
+  const rows = [];
+  rows.push(['●メタ情報']);
+  rows.push(['status', r.status]);
+  rows.push(['取得できた取引数(1ページ)', txs.length]);
+  rows.push(['応答のキー', Object.keys(j).join(', ')]);
+  rows.push(['pagingMetadata(生)', JSON.stringify(meta).slice(0, 1500)]);
+  const dates = txs.map(function (t) { return t.createdAt; }).filter(Boolean).sort();
+  rows.push(['取引の日付範囲', (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '')]);
+  rows.push([]);
+  rows.push(['●Wix支払い（provider / 金額 / 日付JST / providerTransactionId / 商品名）']);
+  txs.forEach(function (t) {
+    rows.push([
+      t.provider,
+      t.amount ? t.amount.amount : '',
+      t.createdAt ? Utilities.formatDate(new Date(t.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '',
+      t.providerTransactionId || '',
+      wixTxProductName_(t),
+    ]);
+  });
+  rows.push([]);
+  rows.push(['●Komoju明細（台帳）（id / 金額 / 日付JST / 商品コード）']);
+  komoju.forEach(function (t) {
+    rows.push([
+      t.id,
+      t.gross,
+      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd'),
+      t.product,
+    ]);
+  });
+
+  // 書き込み（列数を揃える）
+  const maxc = 5;
+  const padded = rows.map(function (rw) { while (rw.length < maxc) rw.push(''); return rw.slice(0, maxc); });
+  sh.getRange(1, 1, padded.length, maxc).setValues(padded);
+  ss.setActiveSheet(sh);
+  ui.alert('「Wix取引診断」に書き出しました。\n1ページの取得数: ' + txs.length +
+    '\n日付範囲: ' + (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '') +
+    '\n\nこのシートを共有ください。');
 }
 
 /**
