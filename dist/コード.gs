@@ -863,6 +863,35 @@ function wixTotal_(order) {
   return isFinite(v) ? Math.round(v) : '';
 }
 
+/** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
+function wixTry_(method, path, body) {
+  try {
+    const opt = { method: method, headers: wixHeaders_(), muteHttpExceptions: true };
+    if (body) opt.payload = JSON.stringify(body);
+    const res = UrlFetchApp.fetch(WIX_BASE + path, opt);
+    return { status: res.getResponseCode(), text: res.getContentText() };
+  } catch (e) {
+    return { status: -1, text: String(e) };
+  }
+}
+
+/** Wixイベント系エンドポイントの候補を順に試す。診断用。 */
+function wixProbeEvents_() {
+  const probes = [
+    ['events一覧(GET v1)', 'get', '/events/v1/events', null],
+    ['events query(v1)', 'post', '/events/v1/events/query', { query: { paging: { limit: 3 } } }],
+    ['events query(v3)', 'post', '/events/v3/events/query', { query: { cursorPaging: { limit: 3 } } }],
+    ['orders query(v1)', 'post', '/events/v1/orders/query', { query: { paging: { limit: 3 } } }],
+    ['orders search(v3)', 'post', '/events/v3/orders/search', { search: { cursorPaging: { limit: 3 } } }],
+    ['orders(GET v2)', 'get', '/events/v2/orders?limit=3', null],
+    ['ticket orders(v2)', 'post', '/events/v2/orders/query', { query: { paging: { limit: 3 } } }],
+  ];
+  return probes.map(function (p) {
+    const r = wixTry_(p[1], p[2], p[3]);
+    return { label: p[0], method: p[1], path: p[2], status: r.status, text: r.text };
+  });
+}
+
 /** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
 function wixOrderProductLabel_(order) {
   if (!order) return '';
@@ -1294,8 +1323,41 @@ function onOpen() {
     .addItem('🔍 Stripe接続テスト', 'testStripe')
     .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
+    .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/**
+ * Wixイベント系APIにアクセスできるか、有力なエンドポイントを順に試して
+ * 「Wixイベント診断」シートに結果（ステータスと応答）を書き出す。
+ */
+function testWixEvents() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  try {
+    const results = wixProbeEvents_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName('Wixイベント診断');
+    if (!sh) sh = ss.insertSheet('Wixイベント診断');
+    sh.clear();
+    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭3000字)'];
+    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
+    const rows = results.map(function (r) {
+      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 3000)];
+    });
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    ss.setActiveSheet(sh);
+
+    const ok = results.filter(function (r) { return r.status === 200; });
+    let msg = 'Wixイベントの入口を ' + results.length + ' 通り試しました。\n';
+    msg += '成功(200): ' + ok.length + ' 件\n';
+    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
+    msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('エラー ❌\n\n' + e.message);
+  }
 }
 
 /**

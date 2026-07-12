@@ -114,6 +114,35 @@ function wixTotal_(order) {
   return isFinite(v) ? Math.round(v) : '';
 }
 
+/** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
+function wixTry_(method, path, body) {
+  try {
+    const opt = { method: method, headers: wixHeaders_(), muteHttpExceptions: true };
+    if (body) opt.payload = JSON.stringify(body);
+    const res = UrlFetchApp.fetch(WIX_BASE + path, opt);
+    return { status: res.getResponseCode(), text: res.getContentText() };
+  } catch (e) {
+    return { status: -1, text: String(e) };
+  }
+}
+
+/** Wixイベント系エンドポイントの候補を順に試す。診断用。 */
+function wixProbeEvents_() {
+  const probes = [
+    ['events一覧(GET v1)', 'get', '/events/v1/events', null],
+    ['events query(v1)', 'post', '/events/v1/events/query', { query: { paging: { limit: 3 } } }],
+    ['events query(v3)', 'post', '/events/v3/events/query', { query: { cursorPaging: { limit: 3 } } }],
+    ['orders query(v1)', 'post', '/events/v1/orders/query', { query: { paging: { limit: 3 } } }],
+    ['orders search(v3)', 'post', '/events/v3/orders/search', { search: { cursorPaging: { limit: 3 } } }],
+    ['orders(GET v2)', 'get', '/events/v2/orders?limit=3', null],
+    ['ticket orders(v2)', 'post', '/events/v2/orders/query', { query: { paging: { limit: 3 } } }],
+  ];
+  return probes.map(function (p) {
+    const r = wixTry_(p[1], p[2], p[3]);
+    return { label: p[0], method: p[1], path: p[2], status: r.status, text: r.text };
+  });
+}
+
 /** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
 function wixOrderProductLabel_(order) {
   if (!order) return '';
