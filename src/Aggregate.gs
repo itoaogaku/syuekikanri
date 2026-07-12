@@ -94,6 +94,7 @@ function buildByKey_(txns, fyList, keyFn, labelField) {
   const out = {};
   fyList.forEach(function (fy) { out[fy] = {}; });
   txns.forEach(function (t) {
+    if (t.kind === 'other') return; // 手数料調整など（商品・決済手段ではない）は除外
     const map = out[t.fy];
     const key = keyFn(t);
     if (!map[key]) {

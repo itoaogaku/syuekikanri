@@ -25,6 +25,9 @@ const PROP_KEYS = {
   KOMOJU_SECRET: 'KOMOJU_SECRET_KEY',   // Komoju のシークレットキー
   KOMOJU_FEE_RATE: 'KOMOJU_FEE_RATE',   // Komoju の手数料率（例 "0.0365" = 3.65%）※純額の概算用
   FISCAL_START: 'FISCAL_YEAR_START_MONTH', // 年度の開始月（1〜12）。既定は 4（4月始まり）
+  WIX_API_KEY: 'WIX_API_KEY',           // Wix APIキー（注文の商品名取得に使用）
+  WIX_ACCOUNT_ID: 'WIX_ACCOUNT_ID',     // Wix アカウントID
+  WIX_SITE_ID: 'WIX_SITE_ID',           // Wix サイトID
 };
 
 /** 通貨設定。日本円は補助単位なし（amount がそのまま円）。 */
@@ -56,4 +59,9 @@ function getKomojuFeeRate_() {
   const raw = getProp_(PROP_KEYS.KOMOJU_FEE_RATE);
   const n = parseFloat(raw);
   return isFinite(n) && n >= 0 ? n : 0;
+}
+
+/** Wix 連携（商品名取得）が設定されているか */
+function isWixEnabled_() {
+  return getProp_(PROP_KEYS.WIX_API_KEY) !== '' && getProp_(PROP_KEYS.WIX_SITE_ID) !== '';
 }

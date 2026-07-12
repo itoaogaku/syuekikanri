@@ -2,7 +2,7 @@
  * ============================================================================
  * 売上レポート自動化 — 全コードまとめ版（このファイル1つを貼り付ければOK）
  * ============================================================================
- * src/ 内の10個のモジュールを1ファイルに結合したものです。
+ * src/ 内のモジュールを1ファイルに結合したものです。
  * 中身を編集したいときは src/ の各ファイルが元になります。
  */
 
@@ -37,6 +37,9 @@ const PROP_KEYS = {
   KOMOJU_SECRET: 'KOMOJU_SECRET_KEY',   // Komoju のシークレットキー
   KOMOJU_FEE_RATE: 'KOMOJU_FEE_RATE',   // Komoju の手数料率（例 "0.0365" = 3.65%）※純額の概算用
   FISCAL_START: 'FISCAL_YEAR_START_MONTH', // 年度の開始月（1〜12）。既定は 4（4月始まり）
+  WIX_API_KEY: 'WIX_API_KEY',           // Wix APIキー（注文の商品名取得に使用）
+  WIX_ACCOUNT_ID: 'WIX_ACCOUNT_ID',     // Wix アカウントID
+  WIX_SITE_ID: 'WIX_SITE_ID',           // Wix サイトID
 };
 
 /** 通貨設定。日本円は補助単位なし（amount がそのまま円）。 */
@@ -68,6 +71,11 @@ function getKomojuFeeRate_() {
   const raw = getProp_(PROP_KEYS.KOMOJU_FEE_RATE);
   const n = parseFloat(raw);
   return isFinite(n) && n >= 0 ? n : 0;
+}
+
+/** Wix 連携（商品名取得）が設定されているか */
+function isWixEnabled_() {
+  return getProp_(PROP_KEYS.WIX_API_KEY) !== '' && getProp_(PROP_KEYS.WIX_SITE_ID) !== '';
 }
 
 
@@ -739,6 +747,125 @@ function komojuParseDate_(s) {
 
 
 // ====================================================================
+// 以下は Wix.gs の内容
+// ====================================================================
+/**
+ * Wix.gs
+ * -----------------------------------------------------------------------------
+ * Wix eCommerce（注文）API クライアント。
+ *
+ * 目的：Komoju の決済は商品名が「注文コード」しか入っていないため、
+ *       Wix の注文データから本当の商品名を取得して補う。
+ *
+ * 認証：アカウントのAPIキー ＋ サイトID ＋ アカウントID をヘッダで渡す。
+ * 参考：https://dev.wix.com/docs/rest/business-solutions/e-commerce/orders
+ */
+
+const WIX_BASE = 'https://www.wixapis.com';
+
+/** Wix 認証ヘッダ */
+function wixHeaders_() {
+  const key = getProp_(PROP_KEYS.WIX_API_KEY);
+  const site = getProp_(PROP_KEYS.WIX_SITE_ID);
+  const account = getProp_(PROP_KEYS.WIX_ACCOUNT_ID);
+  if (!key || !site) throw new Error('Wix の APIキー / サイトID が未設定です。「①」から設定してください。');
+  const h = {
+    'Authorization': key,
+    'wix-site-id': site,
+    'Content-Type': 'application/json',
+  };
+  if (account) h['wix-account-id'] = account;
+  return h;
+}
+
+/** POST して JSON を返す */
+function wixPostJson_(path, body) {
+  const res = UrlFetchApp.fetch(WIX_BASE + path, {
+    method: 'post',
+    headers: wixHeaders_(),
+    payload: JSON.stringify(body || {}),
+    muteHttpExceptions: true,
+  });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code < 200 || code >= 300) {
+    throw new Error('Wix HTTP ' + code + ' : ' + path + '\n' + text.slice(0, 500));
+  }
+  return JSON.parse(text);
+}
+
+/**
+ * 注文を検索して取得（新しい順）。
+ * @param {number} limit 取得件数
+ * @return {Array<Object>} order の配列
+ */
+function wixSearchOrders_(limit) {
+  const body = {
+    search: {
+      cursorPaging: { limit: limit || 100 },
+      sort: [{ fieldName: 'createdDate', order: 'DESC' }],
+    },
+  };
+  const json = wixPostJson_('/ecom/v1/orders/search', body);
+  return json.orders || [];
+}
+
+/** 注文IDで1件取得（見つからなければ null） */
+function wixGetOrderById_(orderId) {
+  try {
+    const res = UrlFetchApp.fetch(WIX_BASE + '/ecom/v1/orders/' + encodeURIComponent(orderId), {
+      method: 'get',
+      headers: wixHeaders_(),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) return null;
+    const json = JSON.parse(res.getContentText());
+    return json.order || json || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
+function wixOrderProductLabel_(order) {
+  if (!order) return '';
+  const items = order.lineItems || [];
+  const names = items.map(function (li) {
+    const pn = li.productName || {};
+    return pn.original || pn.translated || li.name || '';
+  }).filter(function (s) { return s; });
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  return names[0] + ' 他' + (names.length - 1) + '点';
+}
+
+/**
+ * Komoju 明細の商品名を Wix の商品名で補う（Wix未設定なら何もしない）。
+ * 元の注文コードは orderId 列に残す。全体を try/catch で守り、Wix側の
+ * 不調で本体処理が止まらないようにする。
+ *
+ * @param {Array<Object>} txns
+ */
+function wixEnrichKomojuTxns_(txns) {
+  if (!isWixEnabled_()) return;
+  const cache = {}; // code -> productLabel|null
+  txns.forEach(function (t) {
+    if (t.source !== 'Komoju') return;
+    const code = String(t.product || '');
+    if (!code) return;
+    if (!(code in cache)) {
+      const order = wixGetOrderById_(code);
+      cache[code] = order ? wixOrderProductLabel_(order) : null;
+    }
+    if (cache[code]) {
+      if (!t.orderId) t.orderId = code; // 元コードを残す
+      t.product = cache[code];
+    }
+  });
+}
+
+
+// ====================================================================
 // 以下は Aggregate.gs の内容
 // ====================================================================
 /**
@@ -837,6 +964,7 @@ function buildByKey_(txns, fyList, keyFn, labelField) {
   const out = {};
   fyList.forEach(function (fy) { out[fy] = {}; });
   txns.forEach(function (t) {
+    if (t.kind === 'other') return; // 手数料調整など（商品・決済手段ではない）は除外
     const map = out[t.fy];
     const key = keyFn(t);
     if (!map[key]) {
@@ -1127,8 +1255,58 @@ function onOpen() {
     .addSeparator()
     .addItem('🔍 Komoju接続テスト', 'testKomoju')
     .addItem('🔍 Stripe接続テスト', 'testStripe')
+    .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/**
+ * Wix への接続確認。Wixの注文を取得し、台帳のKomoju注文コードと
+ * 一致するか（＝商品名を補えるか）を確認する。
+ */
+function testWix() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) {
+    ui.alert('Wixの APIキー / サイトID が未設定です。「①」から設定してください。');
+    return;
+  }
+  try {
+    const orders = wixSearchOrders_(100);
+    const byId = {}, byNum = {};
+    orders.forEach(function (o) {
+      byId[o.id] = o;
+      if (o.number != null) byNum[String(o.number)] = o;
+    });
+
+    let msg = 'Wix 接続OK ✅\n取得できた注文: ' + orders.length + ' 件\n';
+    if (orders.length) {
+      const o = orders[0];
+      msg += '\n［最新注文の例］\n注文ID: ' + o.id + '\n注文番号: ' + o.number +
+        '\n商品名: ' + (wixOrderProductLabel_(o) || '(なし)') + '\n';
+    }
+
+    // 台帳のKomojuコードと一致するか
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
+    let matched = 0;
+    const samples = [];
+    komoju.forEach(function (t) {
+      const code = String(t.product);
+      const o = byId[code] || byNum[code];
+      if (o) {
+        matched++;
+        if (samples.length < 3) samples.push('  ' + code.slice(0, 12) + '… → ' + wixOrderProductLabel_(o));
+      }
+    });
+    msg += '\nKomoju注文コードとの一致: ' + matched + ' / ' + komoju.length + ' 件';
+    if (samples.length) msg += '\n' + samples.join('\n');
+    else if (komoju.length) msg += '\n（一致なし：取得注文数を増やすか、突き合わせ方法の調整が必要かもしれません）';
+
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('Wix 接続エラー ❌\n\n' + e.message +
+      '\n\nAPIキー・サイトID・アカウントID・権限（Orders 読み取り）をご確認ください。');
+  }
 }
 
 /** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
@@ -1224,6 +1402,8 @@ function runReportForMonth_(year, month1) {
   }
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(from, to);
+    // Wixが設定されていれば、Komojuの商品名をWixの注文から補う（失敗しても本体は継続）
+    try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
   }
@@ -1288,6 +1468,27 @@ function setupApiKeys() {
   if (fiscal.getSelectedButton() === ui.Button.OK && fiscal.getResponseText().trim()) {
     const n = parseInt(fiscal.getResponseText().trim(), 10);
     if (n >= 1 && n <= 12) props.setProperty(PROP_KEYS.FISCAL_START, String(n));
+  }
+
+  const wixKey = ui.prompt('Wix APIキー',
+    'Komojuの商品名をWixから補う場合に入力。使わない/変更しない場合は空でOK。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixKey.getSelectedButton() === ui.Button.OK && wixKey.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_API_KEY, wixKey.getResponseText().trim());
+  }
+
+  const wixSite = ui.prompt('Wix サイトID',
+    'Wix の Site ID（管理画面 dashboard/【ここ】/home のID）。変更しない場合は空。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixSite.getSelectedButton() === ui.Button.OK && wixSite.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_SITE_ID, wixSite.getResponseText().trim());
+  }
+
+  const wixAccount = ui.prompt('Wix アカウントID',
+    'Wix の Account ID。変更しない場合は空。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixAccount.getSelectedButton() === ui.Button.OK && wixAccount.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_ACCOUNT_ID, wixAccount.getResponseText().trim());
   }
 
   ui.alert('設定を保存しました。');

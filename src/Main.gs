@@ -24,8 +24,58 @@ function onOpen() {
     .addSeparator()
     .addItem('🔍 Komoju接続テスト', 'testKomoju')
     .addItem('🔍 Stripe接続テスト', 'testStripe')
+    .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/**
+ * Wix への接続確認。Wixの注文を取得し、台帳のKomoju注文コードと
+ * 一致するか（＝商品名を補えるか）を確認する。
+ */
+function testWix() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) {
+    ui.alert('Wixの APIキー / サイトID が未設定です。「①」から設定してください。');
+    return;
+  }
+  try {
+    const orders = wixSearchOrders_(100);
+    const byId = {}, byNum = {};
+    orders.forEach(function (o) {
+      byId[o.id] = o;
+      if (o.number != null) byNum[String(o.number)] = o;
+    });
+
+    let msg = 'Wix 接続OK ✅\n取得できた注文: ' + orders.length + ' 件\n';
+    if (orders.length) {
+      const o = orders[0];
+      msg += '\n［最新注文の例］\n注文ID: ' + o.id + '\n注文番号: ' + o.number +
+        '\n商品名: ' + (wixOrderProductLabel_(o) || '(なし)') + '\n';
+    }
+
+    // 台帳のKomojuコードと一致するか
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
+    let matched = 0;
+    const samples = [];
+    komoju.forEach(function (t) {
+      const code = String(t.product);
+      const o = byId[code] || byNum[code];
+      if (o) {
+        matched++;
+        if (samples.length < 3) samples.push('  ' + code.slice(0, 12) + '… → ' + wixOrderProductLabel_(o));
+      }
+    });
+    msg += '\nKomoju注文コードとの一致: ' + matched + ' / ' + komoju.length + ' 件';
+    if (samples.length) msg += '\n' + samples.join('\n');
+    else if (komoju.length) msg += '\n（一致なし：取得注文数を増やすか、突き合わせ方法の調整が必要かもしれません）';
+
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('Wix 接続エラー ❌\n\n' + e.message +
+      '\n\nAPIキー・サイトID・アカウントID・権限（Orders 読み取り）をご確認ください。');
+  }
 }
 
 /** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
@@ -121,6 +171,8 @@ function runReportForMonth_(year, month1) {
   }
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(from, to);
+    // Wixが設定されていれば、Komojuの商品名をWixの注文から補う（失敗しても本体は継続）
+    try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
   }
@@ -185,6 +237,27 @@ function setupApiKeys() {
   if (fiscal.getSelectedButton() === ui.Button.OK && fiscal.getResponseText().trim()) {
     const n = parseInt(fiscal.getResponseText().trim(), 10);
     if (n >= 1 && n <= 12) props.setProperty(PROP_KEYS.FISCAL_START, String(n));
+  }
+
+  const wixKey = ui.prompt('Wix APIキー',
+    'Komojuの商品名をWixから補う場合に入力。使わない/変更しない場合は空でOK。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixKey.getSelectedButton() === ui.Button.OK && wixKey.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_API_KEY, wixKey.getResponseText().trim());
+  }
+
+  const wixSite = ui.prompt('Wix サイトID',
+    'Wix の Site ID（管理画面 dashboard/【ここ】/home のID）。変更しない場合は空。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixSite.getSelectedButton() === ui.Button.OK && wixSite.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_SITE_ID, wixSite.getResponseText().trim());
+  }
+
+  const wixAccount = ui.prompt('Wix アカウントID',
+    'Wix の Account ID。変更しない場合は空。',
+    ui.ButtonSet.OK_CANCEL);
+  if (wixAccount.getSelectedButton() === ui.Button.OK && wixAccount.getResponseText().trim()) {
+    props.setProperty(PROP_KEYS.WIX_ACCOUNT_ID, wixAccount.getResponseText().trim());
   }
 
   ui.alert('設定を保存しました。');
