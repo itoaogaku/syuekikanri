@@ -335,6 +335,14 @@ function runReportForMonth_(year, month1) {
     try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
+    // Komojuの実際の入金（精算）をこの月分だけ入金台帳へ
+    try {
+      const netSum = k.txns.reduce(function (s, t) { return s + t.net; }, 0);
+      const setls = komojuListAllSettlements_().map(komojuSettlementRecord_)
+        .filter(function (p) { return p.yearMonth === yearMonth; });
+      setls.forEach(function (p) { p.calculatedNet = Math.round(netSum); });
+      payouts = payouts.concat(setls);
+    } catch (e) { /* 精算取得に失敗しても継続 */ }
   }
 
   // 台帳へ蓄積（その月・そのサービス分を入れ替え）
@@ -386,6 +394,7 @@ function runBulkImport() {
 
   // Komoju を期間分まとめて取得し、Wix支払いの索引で商品名を一括付与、月ごとに振り分け
   const komojuByYm = {};
+  const komojuSetlByYm = {};
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(rangeFrom, rangeTo);
     try {
@@ -398,6 +407,12 @@ function runBulkImport() {
       const ym = Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM');
       (komojuByYm[ym] = komojuByYm[ym] || []).push(t);
     });
+    // 精算（実際の入金）も一度だけ取得して月ごとに振り分け
+    try {
+      komojuListAllSettlements_().map(komojuSettlementRecord_).forEach(function (p) {
+        if (p.yearMonth) (komojuSetlByYm[p.yearMonth] = komojuSetlByYm[p.yearMonth] || []).push(p);
+      });
+    } catch (e) { /* 継続 */ }
   }
 
   let total = 0, done = 0, stoppedAt = null;
@@ -417,8 +432,11 @@ function runBulkImport() {
       sources.push('Stripe');
     }
     if (isKomojuEnabled_()) {
-      txns = txns.concat(komojuByYm[ym] || []);
+      const kt = komojuByYm[ym] || [];
+      txns = txns.concat(kt);
       sources.push('Komoju');
+      const netSum = kt.reduce(function (s, t) { return s + t.net; }, 0);
+      (komojuSetlByYm[ym] || []).forEach(function (p) { p.calculatedNet = Math.round(netSum); payouts.push(p); });
     }
     upsertLedger_(ss, txns, ym, sources);
     upsertPayoutLedger_(ss, payouts, ym, sources);

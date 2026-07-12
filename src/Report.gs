@@ -210,13 +210,15 @@ function writeReconcileSheet_(ss, payouts) {
   });
   const body = sorted.map(function (p) {
     const diff = p.payoutAmount - p.calculatedNet;
+    const isKomoju = p.source === 'Komoju';
+    // Komojuの純額は概算のため差額は出る。実際の入金額（payoutAmount）が正。
+    const judge = isKomoju ? '実入金額（純額は概算）' : (Math.abs(diff) <= 1 ? '✓ 一致' : '要確認');
     return [
       p.source,
       fiscalYearLabel_(fiscalYearOf_(p.arrivalDate)),
       p.payoutId,
       Utilities.formatDate(p.arrivalDate, 'Asia/Tokyo', 'yyyy/MM/dd'),
-      p.payoutAmount, p.calculatedNet, diff,
-      Math.abs(diff) <= 1 ? '✓ 一致' : '要確認',
+      p.payoutAmount, p.calculatedNet, diff, judge,
     ];
   });
   if (body.length) {

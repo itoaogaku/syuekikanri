@@ -23,6 +23,37 @@ function komojuHeaders_() {
   return { Authorization: 'Basic ' + Utilities.base64Encode(key + ':') };
 }
 
+/** Komojuの精算（入金）を全件取得。 */
+function komojuListAllSettlements_() {
+  const out = [];
+  let page = 1;
+  while (page <= 100) {
+    const json = httpGetJson_(KOMOJU_BASE + '/settlements?' + buildQuery_([['page', page], ['per_page', 100]]), komojuHeaders_());
+    const data = json.data || [];
+    data.forEach(function (s) { out.push(s); });
+    if (!data.length) break;
+    if (json.last_page && page >= json.last_page) break;
+    if (data.length < (json.per_page || 100)) break;
+    page++;
+  }
+  return out;
+}
+
+/** Komojuの精算を、入金台帳レコード形式へ変換（実際の振込額）。 */
+function komojuSettlementRecord_(s) {
+  const cutoff = s.cutoff_time ? new Date(s.cutoff_time) : (s.created_at ? new Date(s.created_at) : null);
+  const arrival = s.created_at ? new Date(s.created_at) : cutoff;
+  return {
+    source: 'Komoju',
+    payoutId: s.reference || s.id,
+    arrivalDate: arrival || new Date(),
+    yearMonth: cutoff ? Utilities.formatDate(cutoff, 'Asia/Tokyo', 'yyyy-MM') : '',
+    payoutAmount: parseInt(s.amount, 10) || 0,   // 実際に振り込まれた額（純額）
+    calculatedNet: 0,                            // 呼び出し側でその月のKomoju純額合計を入れる
+    status: s.status || '',
+  };
+}
+
 /** 任意の Komoju エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
 function komojuTry_(method, path) {
   try {

@@ -719,6 +719,37 @@ function komojuHeaders_() {
   return { Authorization: 'Basic ' + Utilities.base64Encode(key + ':') };
 }
 
+/** Komojuの精算（入金）を全件取得。 */
+function komojuListAllSettlements_() {
+  const out = [];
+  let page = 1;
+  while (page <= 100) {
+    const json = httpGetJson_(KOMOJU_BASE + '/settlements?' + buildQuery_([['page', page], ['per_page', 100]]), komojuHeaders_());
+    const data = json.data || [];
+    data.forEach(function (s) { out.push(s); });
+    if (!data.length) break;
+    if (json.last_page && page >= json.last_page) break;
+    if (data.length < (json.per_page || 100)) break;
+    page++;
+  }
+  return out;
+}
+
+/** Komojuの精算を、入金台帳レコード形式へ変換（実際の振込額）。 */
+function komojuSettlementRecord_(s) {
+  const cutoff = s.cutoff_time ? new Date(s.cutoff_time) : (s.created_at ? new Date(s.created_at) : null);
+  const arrival = s.created_at ? new Date(s.created_at) : cutoff;
+  return {
+    source: 'Komoju',
+    payoutId: s.reference || s.id,
+    arrivalDate: arrival || new Date(),
+    yearMonth: cutoff ? Utilities.formatDate(cutoff, 'Asia/Tokyo', 'yyyy-MM') : '',
+    payoutAmount: parseInt(s.amount, 10) || 0,   // 実際に振り込まれた額（純額）
+    calculatedNet: 0,                            // 呼び出し側でその月のKomoju純額合計を入れる
+    status: s.status || '',
+  };
+}
+
 /** 任意の Komoju エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
 function komojuTry_(method, path) {
   try {
@@ -1682,13 +1713,15 @@ function writeReconcileSheet_(ss, payouts) {
   });
   const body = sorted.map(function (p) {
     const diff = p.payoutAmount - p.calculatedNet;
+    const isKomoju = p.source === 'Komoju';
+    // Komojuの純額は概算のため差額は出る。実際の入金額（payoutAmount）が正。
+    const judge = isKomoju ? '実入金額（純額は概算）' : (Math.abs(diff) <= 1 ? '✓ 一致' : '要確認');
     return [
       p.source,
       fiscalYearLabel_(fiscalYearOf_(p.arrivalDate)),
       p.payoutId,
       Utilities.formatDate(p.arrivalDate, 'Asia/Tokyo', 'yyyy/MM/dd'),
-      p.payoutAmount, p.calculatedNet, diff,
-      Math.abs(diff) <= 1 ? '✓ 一致' : '要確認',
+      p.payoutAmount, p.calculatedNet, diff, judge,
     ];
   });
   if (body.length) {
@@ -2050,6 +2083,14 @@ function runReportForMonth_(year, month1) {
     try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
+    // Komojuの実際の入金（精算）をこの月分だけ入金台帳へ
+    try {
+      const netSum = k.txns.reduce(function (s, t) { return s + t.net; }, 0);
+      const setls = komojuListAllSettlements_().map(komojuSettlementRecord_)
+        .filter(function (p) { return p.yearMonth === yearMonth; });
+      setls.forEach(function (p) { p.calculatedNet = Math.round(netSum); });
+      payouts = payouts.concat(setls);
+    } catch (e) { /* 精算取得に失敗しても継続 */ }
   }
 
   // 台帳へ蓄積（その月・そのサービス分を入れ替え）
@@ -2101,6 +2142,7 @@ function runBulkImport() {
 
   // Komoju を期間分まとめて取得し、Wix支払いの索引で商品名を一括付与、月ごとに振り分け
   const komojuByYm = {};
+  const komojuSetlByYm = {};
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(rangeFrom, rangeTo);
     try {
@@ -2113,6 +2155,12 @@ function runBulkImport() {
       const ym = Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM');
       (komojuByYm[ym] = komojuByYm[ym] || []).push(t);
     });
+    // 精算（実際の入金）も一度だけ取得して月ごとに振り分け
+    try {
+      komojuListAllSettlements_().map(komojuSettlementRecord_).forEach(function (p) {
+        if (p.yearMonth) (komojuSetlByYm[p.yearMonth] = komojuSetlByYm[p.yearMonth] || []).push(p);
+      });
+    } catch (e) { /* 継続 */ }
   }
 
   let total = 0, done = 0, stoppedAt = null;
@@ -2132,8 +2180,11 @@ function runBulkImport() {
       sources.push('Stripe');
     }
     if (isKomojuEnabled_()) {
-      txns = txns.concat(komojuByYm[ym] || []);
+      const kt = komojuByYm[ym] || [];
+      txns = txns.concat(kt);
       sources.push('Komoju');
+      const netSum = kt.reduce(function (s, t) { return s + t.net; }, 0);
+      (komojuSetlByYm[ym] || []).forEach(function (p) { p.calculatedNet = Math.round(netSum); payouts.push(p); });
     }
     upsertLedger_(ss, txns, ym, sources);
     upsertPayoutLedger_(ss, payouts, ym, sources);
