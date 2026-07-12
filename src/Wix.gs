@@ -316,16 +316,18 @@ function wixOrderProductLabel_(order) {
 //   これを Komoju 明細と突き合わせて商品名を自動で埋める。
 // ---------------------------------------------------------------------------
 
-/** 支払いトランザクションを新しい順に取得し、fromDate より古くなったら停止 */
+/**
+ * 支払いトランザクションを新しい順に取得し、fromDate より古くなったら停止。
+ * ページ送りは offset 方式（?limit=100&offset=N）。
+ */
 function wixListTransactionsUntil_(fromDate) {
   const out = [];
-  let cursor = null;
+  const limit = 100;
+  let offset = 0;
   let guard = 0;
-  while (guard < 80) {
+  while (guard < 300) {
     guard++;
-    let path = '/payments/v2/transactions?cursorPaging.limit=100';
-    if (cursor) path += '&cursorPaging.cursor=' + encodeURIComponent(cursor);
-    const r = wixTry_('get', path, null);
+    const r = wixTry_('get', '/payments/v2/transactions?limit=' + limit + '&offset=' + offset, null);
     if (r.status !== 200) break;
     let j;
     try { j = JSON.parse(r.text); } catch (e) { break; }
@@ -333,14 +335,15 @@ function wixListTransactionsUntil_(fromDate) {
     if (!txs.length) break;
     txs.forEach(function (t) { out.push(t); });
 
-    // このページの最古が fromDate より前なら、以降はもっと古いので停止
+    // このページの最古が fromDate より前なら停止（新しい順のため）
     const last = txs[txs.length - 1];
     const lastDate = last.createdAt ? new Date(last.createdAt) : null;
     if (lastDate && lastDate.getTime() < fromDate.getTime()) break;
+    if (txs.length < limit) break;
 
-    const meta = j.pagingMetadata || j.metadata || {};
-    cursor = (meta.cursors && meta.cursors.next) || meta.nextCursor || null;
-    if (!cursor) break;
+    offset += limit;
+    const total = j.pagination && j.pagination.total;
+    if (typeof total === 'number' && offset >= total) break;
   }
   return out;
 }
@@ -379,29 +382,34 @@ function wixEnrichKomojuTxns_(txns) {
   const from = new Date(minDate.getTime() - 4 * 86400000);
 
   const wtx = wixListTransactionsUntil_(from);
-  const byProv = {};      // providerTransactionId -> 商品名
-  const byAmtDate = {};   // "金額|yyyy-MM-dd" -> [商品名...]（Stripe以外）
+  const byProv = {};       // providerTransactionId -> 商品名（全provider）
+  const nonStripe = [];    // Stripe以外の取引（金額＋日付で突き合わせる候補）
   wtx.forEach(function (w) {
     const name = wixTxProductName_(w);
     if (!name) return;
     if (w.providerTransactionId) byProv[String(w.providerTransactionId)] = name;
     if (!wixIsStripeTx_(w)) {
-      const amt = w.amount ? Math.round(w.amount.amount) : '';
-      const d = w.createdAt ? Utilities.formatDate(new Date(w.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '';
-      const key = amt + '|' + d;
-      (byAmtDate[key] = byAmtDate[key] || []).push(name);
+      nonStripe.push({
+        amt: w.amount ? Math.round(w.amount.amount) : null,
+        date: w.createdAt ? new Date(w.createdAt) : null,
+        name: name,
+      });
     }
   });
 
+  const DAY = 86400000;
   let filled = 0;
   txns.forEach(function (t) {
     if (t.source !== 'Komoju') return;
+    // ① 決済代行ID（Komoju決済ID）で厳密一致
     let name = byProv[String(t.id)];
+    // ② 金額一致 かつ 日付が±4日以内（コンビニの入金日ズレに対応）で、候補の商品名が一意なら採用
     if (!name) {
-      const key = Math.round(t.gross) + '|' + Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd');
-      const cand = byAmtDate[key];
-      if (cand && cand.length === 1) name = cand[0];
-      else if (cand && cand.length > 1 && allSame_(cand)) name = cand[0];
+      const amt = Math.round(t.gross);
+      const cands = nonStripe.filter(function (w) {
+        return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
+      }).map(function (w) { return w.name; });
+      if (cands.length && allSame_(cands)) name = cands[0];
     }
     if (name) {
       if (!t.orderId) t.orderId = String(t.id);
