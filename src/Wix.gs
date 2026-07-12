@@ -160,6 +160,28 @@ function wixProbePurchases_() {
   return results;
 }
 
+/** Wixの「支払い(Payments)」「フォーム(Forms)」系エンドポイント候補を試す。診断用。 */
+function wixProbePayments_() {
+  const cands = [
+    ['payments v2 tx query', 'post', '/payments/v2/transactions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['payments v1 tx query', 'post', '/payments/v1/transactions/query', { query: { paging: { limit: 5 } } }],
+    ['payments v3 tx search', 'post', '/payments/v3/transactions/search', { search: { cursorPaging: { limit: 5 } } }],
+    ['payments v2 tx GET', 'get', '/payments/v2/transactions?limit=5', null],
+    ['payments v1 tx GET', 'get', '/payments/v1/transactions?limit=5', null],
+    ['cashier tx query', 'post', '/cashier/v1/transactions/query', { query: { paging: { limit: 5 } } }],
+    ['payment-transactions GET', 'get', '/payment-transactions/v1/transactions?limit=5', null],
+    ['ecom payments query', 'post', '/ecom/v1/payments/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v4 query', 'post', '/form-submissions/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v1 query', 'post', '/form-submissions/v1/submissions/query', { query: { paging: { limit: 5 } } }],
+    ['forms v4 submissions query', 'post', '/forms/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v4 search', 'post', '/form-submissions/v4/submissions/search', { search: { cursorPaging: { limit: 5 } } }],
+  ];
+  return cands.map(function (c) {
+    const r = wixTry_(c[1], c[2], c[3]);
+    return { label: c[0], method: c[1], path: c[2], status: r.status, text: r.text };
+  });
+}
+
 /** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
 function wixTry_(method, path, body) {
   try {

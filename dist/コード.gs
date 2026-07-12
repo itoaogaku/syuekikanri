@@ -1005,6 +1005,28 @@ function wixProbePurchases_() {
   return results;
 }
 
+/** Wixの「支払い(Payments)」「フォーム(Forms)」系エンドポイント候補を試す。診断用。 */
+function wixProbePayments_() {
+  const cands = [
+    ['payments v2 tx query', 'post', '/payments/v2/transactions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['payments v1 tx query', 'post', '/payments/v1/transactions/query', { query: { paging: { limit: 5 } } }],
+    ['payments v3 tx search', 'post', '/payments/v3/transactions/search', { search: { cursorPaging: { limit: 5 } } }],
+    ['payments v2 tx GET', 'get', '/payments/v2/transactions?limit=5', null],
+    ['payments v1 tx GET', 'get', '/payments/v1/transactions?limit=5', null],
+    ['cashier tx query', 'post', '/cashier/v1/transactions/query', { query: { paging: { limit: 5 } } }],
+    ['payment-transactions GET', 'get', '/payment-transactions/v1/transactions?limit=5', null],
+    ['ecom payments query', 'post', '/ecom/v1/payments/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v4 query', 'post', '/form-submissions/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v1 query', 'post', '/form-submissions/v1/submissions/query', { query: { paging: { limit: 5 } } }],
+    ['forms v4 submissions query', 'post', '/forms/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
+    ['form-submissions v4 search', 'post', '/form-submissions/v4/submissions/search', { search: { cursorPaging: { limit: 5 } } }],
+  ];
+  return cands.map(function (c) {
+    const r = wixTry_(c[1], c[2], c[3]);
+    return { label: c[0], method: c[1], path: c[2], status: r.status, text: r.text };
+  });
+}
+
 /** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
 function wixTry_(method, path, body) {
   try {
@@ -1507,6 +1529,7 @@ function onOpen() {
     .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
     .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
     .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
+    .addItem('🔍 Wix支払い/フォームを調べる（診断）', 'testWixPayments')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
@@ -1537,6 +1560,33 @@ function testWixEvents() {
     msg += '成功(200): ' + ok.length + ' 件\n';
     results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
     msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('エラー ❌\n\n' + e.message);
+  }
+}
+
+/** Wixの支払い/フォーム系APIの入口を探して「Wix支払い診断」シートに書き出す。 */
+function testWixPayments() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  try {
+    const results = wixProbePayments_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName('Wix支払い診断');
+    if (!sh) sh = ss.insertSheet('Wix支払い診断');
+    sh.clear();
+    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
+    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
+    const rows = results.map(function (r) {
+      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
+    });
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    ss.setActiveSheet(sh);
+    const ok = results.filter(function (r) { return r.status === 200; });
+    let msg = '支払い/フォームの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
+    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
+    msg += '\n詳しい応答は「Wix支払い診断」シートに書き出しました。共有ください。';
     ui.alert(msg);
   } catch (e) {
     ui.alert('エラー ❌\n\n' + e.message);
