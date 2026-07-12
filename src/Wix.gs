@@ -75,17 +75,35 @@ function wixGetOrderById_(orderId) {
   }
 }
 
-/** 期間（createdDate）で注文を検索。診断・突き合わせ用。 */
-function wixSearchOrdersByDate_(fromIso, toIso, limit) {
-  const body = {
-    search: {
-      filter: { createdDate: { '$gte': fromIso, '$lte': toIso } },
-      cursorPaging: { limit: limit || 100 },
-      sort: [{ fieldName: 'createdDate', order: 'ASC' }],
-    },
-  };
-  const json = wixPostJson_('/ecom/v1/orders/search', body);
-  return json.orders || [];
+/**
+ * 注文を新しい順にページ送りで取得し、指定日 fromDate より古い注文が
+ * 出てきたら停止する（フィルターAPIの書式差異を避けるためクライアント側で絞る）。
+ * @param {Date} fromDate これより新しい注文まで取得
+ * @return {Array<Object>}
+ */
+function wixListOrdersDescUntil_(fromDate) {
+  const out = [];
+  let cursor = null;
+  let guard = 0;
+  while (guard < 60) {
+    guard++;
+    const search = cursor
+      ? { cursorPaging: { limit: 100, cursor: cursor } }
+      : { cursorPaging: { limit: 100 }, sort: [{ fieldName: 'createdDate', order: 'DESC' }] };
+    const json = wixPostJson_('/ecom/v1/orders/search', { search: search });
+    const orders = json.orders || [];
+    if (!orders.length) break;
+    orders.forEach(function (o) { out.push(o); });
+
+    const last = orders[orders.length - 1];
+    const lastDate = new Date(last.createdDate);
+    if (lastDate.getTime() < fromDate.getTime()) break; // これ以降はもっと古い
+
+    const meta = json.metadata || json.pagingMetadata || {};
+    cursor = (meta.cursors || {}).next || null;
+    if (!cursor) break;
+  }
+  return out;
 }
 
 /** 注文の合計金額（数値・円）を返す */

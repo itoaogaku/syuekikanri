@@ -44,11 +44,13 @@ function dumpWixDiagnostic() {
   const y = parseInt(m[1], 10), mo = parseInt(m[2], 10);
   const from = new Date(y, mo - 1, 1, 0, 0, 0);
   const to = new Date(y, mo, 0, 23, 59, 59);
-  const fromIso = Utilities.formatDate(from, 'UTC', "yyyy-MM-dd'T'HH:mm:ss.000'Z'");
-  const toIso = Utilities.formatDate(to, 'UTC', "yyyy-MM-dd'T'HH:mm:ss.999'Z'");
 
   try {
-    const orders = wixSearchOrdersByDate_(fromIso, toIso, 100);
+    const all = wixListOrdersDescUntil_(from);
+    const orders = all.filter(function (o) {
+      const d = new Date(o.createdDate);
+      return d.getTime() >= from.getTime() && d.getTime() <= to.getTime();
+    });
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     let sh = ss.getSheetByName('Wix診断');
     if (!sh) sh = ss.insertSheet('Wix診断');
