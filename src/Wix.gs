@@ -398,18 +398,27 @@ function wixEnrichKomojuTxns_(txns) {
   });
 
   const DAY = 86400000;
+  const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
   let filled = 0;
   txns.forEach(function (t) {
     if (t.source !== 'Komoju') return;
     // ① 決済代行ID（Komoju決済ID）で厳密一致
     let name = byProv[String(t.id)];
-    // ② 金額一致 かつ 日付が±4日以内（コンビニの入金日ズレに対応）で、候補の商品名が一意なら採用
     if (!name) {
       const amt = Math.round(t.gross);
-      const cands = nonStripe.filter(function (w) {
-        return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
+      const tYmd = ymd(t.date);
+      // ② まず「同じ金額・同じ日付」で照合（最も確実）。商品名が一意なら採用
+      const sameDay = nonStripe.filter(function (w) {
+        return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
-      if (cands.length && allSame_(cands)) name = cands[0];
+      if (sameDay.length && allSame_(sameDay)) name = sameDay[0];
+      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）。一意なら採用
+      if (!name) {
+        const near = nonStripe.filter(function (w) {
+          return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
+        }).map(function (w) { return w.name; });
+        if (near.length && allSame_(near)) name = near[0];
+      }
     }
     if (name) {
       if (!t.orderId) t.orderId = String(t.id);
