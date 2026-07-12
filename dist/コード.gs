@@ -2,8 +2,6 @@
  * ============================================================================
  * 売上レポート自動化 — 全コードまとめ版（このファイル1つを貼り付ければOK）
  * ============================================================================
- * src/ 内のモジュールを1ファイルに結合したものです。
- * 中身を編集したいときは src/ の各ファイルが元になります。
  */
 
 
@@ -826,6 +824,27 @@ function wixGetOrderById_(orderId) {
   }
 }
 
+/** 期間（createdDate）で注文を検索。診断・突き合わせ用。 */
+function wixSearchOrdersByDate_(fromIso, toIso, limit) {
+  const body = {
+    search: {
+      filter: { createdDate: { '$gte': fromIso, '$lte': toIso } },
+      cursorPaging: { limit: limit || 100 },
+      sort: [{ fieldName: 'createdDate', order: 'ASC' }],
+    },
+  };
+  const json = wixPostJson_('/ecom/v1/orders/search', body);
+  return json.orders || [];
+}
+
+/** 注文の合計金額（数値・円）を返す */
+function wixTotal_(order) {
+  const ps = order.priceSummary || {};
+  const t = ps.total || {};
+  const v = parseFloat(t.amount != null ? t.amount : (order.totals && order.totals.total));
+  return isFinite(v) ? Math.round(v) : '';
+}
+
 /** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
 function wixOrderProductLabel_(order) {
   if (!order) return '';
@@ -1256,8 +1275,47 @@ function onOpen() {
     .addItem('🔍 Komoju接続テスト', 'testKomoju')
     .addItem('🔍 Stripe接続テスト', 'testStripe')
     .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
+    .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/**
+ * 指定月のWix注文を「Wix診断」シートに書き出す。
+ * Komojuとの正しい突き合わせ方法を設計するための調査用。
+ */
+function dumpWixDiagnostic() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  const res = ui.prompt('Wix注文の書き出し', '対象の年月を入力（例: 2026-06）', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const m = String(res.getResponseText()).match(/^(\d{4})[-\/](\d{1,2})$/);
+  if (!m) { ui.alert('形式が不正です。例: 2026-06'); return; }
+  const y = parseInt(m[1], 10), mo = parseInt(m[2], 10);
+  const from = new Date(y, mo - 1, 1, 0, 0, 0);
+  const to = new Date(y, mo, 0, 23, 59, 59);
+  const fromIso = Utilities.formatDate(from, 'UTC', "yyyy-MM-dd'T'HH:mm:ss.000'Z'");
+  const toIso = Utilities.formatDate(to, 'UTC', "yyyy-MM-dd'T'HH:mm:ss.999'Z'");
+
+  try {
+    const orders = wixSearchOrdersByDate_(fromIso, toIso, 100);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName('Wix診断');
+    if (!sh) sh = ss.insertSheet('Wix診断');
+    sh.clear();
+    const header = ['注文番号', '注文ID', '作成日', '合計金額', '商品名', '生データ(先頭4000字)'];
+    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
+    const rows = orders.map(function (o) {
+      return [o.number, o.id, o.createdDate, wixTotal_(o), wixOrderProductLabel_(o),
+        JSON.stringify(o).slice(0, 4000)];
+    });
+    if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    ss.setActiveSheet(sh);
+    ui.alert(orders.length + ' 件のWix注文を「Wix診断」シートに書き出しました。\n' +
+      'このシートを（Komoju明細とあわせて）共有いただければ、正しい紐付けを作ります。');
+  } catch (e) {
+    ui.alert('Wix注文の取得エラー ❌\n\n' + e.message);
+  }
 }
 
 /**

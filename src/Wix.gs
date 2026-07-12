@@ -75,6 +75,27 @@ function wixGetOrderById_(orderId) {
   }
 }
 
+/** 期間（createdDate）で注文を検索。診断・突き合わせ用。 */
+function wixSearchOrdersByDate_(fromIso, toIso, limit) {
+  const body = {
+    search: {
+      filter: { createdDate: { '$gte': fromIso, '$lte': toIso } },
+      cursorPaging: { limit: limit || 100 },
+      sort: [{ fieldName: 'createdDate', order: 'ASC' }],
+    },
+  };
+  const json = wixPostJson_('/ecom/v1/orders/search', body);
+  return json.orders || [];
+}
+
+/** 注文の合計金額（数値・円）を返す */
+function wixTotal_(order) {
+  const ps = order.priceSummary || {};
+  const t = ps.total || {};
+  const v = parseFloat(t.amount != null ? t.amount : (order.totals && order.totals.total));
+  return isFinite(v) ? Math.round(v) : '';
+}
+
 /** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
 function wixOrderProductLabel_(order) {
   if (!order) return '';
