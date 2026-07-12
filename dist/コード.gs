@@ -863,6 +863,52 @@ function wixTotal_(order) {
   return isFinite(v) ? Math.round(v) : '';
 }
 
+/** イベント一覧を取得（中身が取れる GET ?limit 方式）。 */
+function wixListEvents_(limit) {
+  const r = wixTry_('get', '/events/v1/events?limit=' + (limit || 50), null);
+  try { return (JSON.parse(r.text).events) || []; } catch (e) { return []; }
+}
+
+/** イベントの開始日（Date）を取り出す */
+function wixEventStart_(e) {
+  const s = e && e.scheduling && e.scheduling.config && e.scheduling.config.startDate;
+  return s ? new Date(s) : null;
+}
+
+/**
+ * 「購入者・注文データ」の入口を、過去の対象イベントに絞って探す診断。
+ * tickets / guests など複数の入口を叩き、結果を返す。
+ */
+function wixProbePurchases_() {
+  const results = [];
+  const events = wixListEvents_(50);
+  const now = new Date();
+  // 記録挑戦会・大会・対抗戦 で、既に開催済み（＝購入がありそう）なものを対象に
+  const targets = events.filter(function (e) {
+    const t = e.title || '';
+    const start = wixEventStart_(e);
+    const isPast = start ? (start.getTime() < now.getTime()) : true;
+    return /記録挑戦会|対抗戦|大会/.test(t) && isPast;
+  }).slice(0, 3);
+
+  if (!targets.length && events.length) targets.push(events[0]);
+
+  targets.forEach(function (e) {
+    const id = e.id;
+    const eps = [
+      ['tickets(GET)', 'get', '/events/v1/events/' + id + '/tickets?limit=100', null],
+      ['guests(GET)', 'get', '/events/v1/events/' + id + '/guests?limit=100', null],
+      ['guests query v3', 'post', '/events/v3/guests/query', { query: { filter: { eventId: id }, cursorPaging: { limit: 50 } } }],
+      ['guests query v1', 'post', '/events/v1/guests/query', { query: { paging: { limit: 50 }, filter: { eventId: id } } }],
+    ];
+    eps.forEach(function (ep) {
+      const r = wixTry_(ep[1], ep[2], ep[3]);
+      results.push({ label: '[' + (e.title || '').slice(0, 16) + '] ' + ep[0], method: ep[1], path: ep[2], status: r.status, text: r.text });
+    });
+  });
+  return results;
+}
+
 /** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
 function wixTry_(method, path, body) {
   try {
@@ -1359,6 +1405,7 @@ function onOpen() {
     .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
     .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
+    .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
@@ -1389,6 +1436,35 @@ function testWixEvents() {
     msg += '成功(200): ' + ok.length + ' 件\n';
     results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
     msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('エラー ❌\n\n' + e.message);
+  }
+}
+
+/** 過去イベントの購入者・注文データの入口を探して「Wix購入診断」シートに書き出す。 */
+function testWixPurchases() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  try {
+    const results = wixProbePurchases_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName('Wix購入診断');
+    if (!sh) sh = ss.insertSheet('Wix購入診断');
+    sh.clear();
+    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
+    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
+    if (results.length) {
+      const rows = results.map(function (r) {
+        return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
+      });
+      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    }
+    ss.setActiveSheet(sh);
+    const ok = results.filter(function (r) { return r.status === 200; });
+    let msg = '購入データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
+    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
+    msg += '\n詳しい応答は「Wix購入診断」シートに書き出しました。共有ください。';
     ui.alert(msg);
   } catch (e) {
     ui.alert('エラー ❌\n\n' + e.message);

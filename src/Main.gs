@@ -27,6 +27,7 @@ function onOpen() {
     .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
     .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
     .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
+    .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
@@ -57,6 +58,35 @@ function testWixEvents() {
     msg += '成功(200): ' + ok.length + ' 件\n';
     results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
     msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('エラー ❌\n\n' + e.message);
+  }
+}
+
+/** 過去イベントの購入者・注文データの入口を探して「Wix購入診断」シートに書き出す。 */
+function testWixPurchases() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  try {
+    const results = wixProbePurchases_();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName('Wix購入診断');
+    if (!sh) sh = ss.insertSheet('Wix購入診断');
+    sh.clear();
+    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
+    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
+    if (results.length) {
+      const rows = results.map(function (r) {
+        return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
+      });
+      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    }
+    ss.setActiveSheet(sh);
+    const ok = results.filter(function (r) { return r.status === 200; });
+    let msg = '購入データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
+    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
+    msg += '\n詳しい応答は「Wix購入診断」シートに書き出しました。共有ください。';
     ui.alert(msg);
   } catch (e) {
     ui.alert('エラー ❌\n\n' + e.message);
