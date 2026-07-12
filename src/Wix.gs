@@ -259,27 +259,109 @@ function wixOrderProductLabel_(order) {
   return names[0] + ' 他' + (names.length - 1) + '点';
 }
 
+// ---------------------------------------------------------------------------
+// Wix「支払い(Payments)」トランザクションからの商品名補完
+//   /payments/v2/transactions に、金額・日付・商品名・決済代行ID が揃っている。
+//   これを Komoju 明細と突き合わせて商品名を自動で埋める。
+// ---------------------------------------------------------------------------
+
+/** 支払いトランザクションを新しい順に取得し、fromDate より古くなったら停止 */
+function wixListTransactionsUntil_(fromDate) {
+  const out = [];
+  let cursor = null;
+  let guard = 0;
+  while (guard < 80) {
+    guard++;
+    let path = '/payments/v2/transactions?cursorPaging.limit=100';
+    if (cursor) path += '&cursorPaging.cursor=' + encodeURIComponent(cursor);
+    const r = wixTry_('get', path, null);
+    if (r.status !== 200) break;
+    let j;
+    try { j = JSON.parse(r.text); } catch (e) { break; }
+    const txs = j.transactions || [];
+    if (!txs.length) break;
+    txs.forEach(function (t) { out.push(t); });
+
+    // このページの最古が fromDate より前なら、以降はもっと古いので停止
+    const last = txs[txs.length - 1];
+    const lastDate = last.createdAt ? new Date(last.createdAt) : null;
+    if (lastDate && lastDate.getTime() < fromDate.getTime()) break;
+
+    const meta = j.pagingMetadata || j.metadata || {};
+    cursor = (meta.cursors && meta.cursors.next) || meta.nextCursor || null;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+/** 支払いトランザクションから商品名ラベルを作る */
+function wixTxProductName_(tx) {
+  const items = (tx.order && tx.order.description && tx.order.description.items) || [];
+  const names = items.map(function (it) { return it.name; }).filter(function (s) { return s; });
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  return names[0] + ' 他' + (names.length - 1) + '点';
+}
+
+function wixIsStripeTx_(tx) {
+  return String(tx.provider || '').toLowerCase().indexOf('stripe') !== -1;
+}
+
 /**
- * Komoju 明細の商品名を Wix の商品名で補う（Wix未設定なら何もしない）。
- * 元の注文コードは orderId 列に残す。全体を try/catch で守り、Wix側の
- * 不調で本体処理が止まらないようにする。
+ * Komoju 明細の商品名を、Wixの支払いトランザクションから補完する。
+ * 突き合わせ:  ① 決済代行ID（providerTransactionId＝Komoju決済ID）で厳密一致
+ *              ② 金額＋日付（Stripe以外の支払いに限定）で一致
+ * Wix未設定・不調でも本体処理は止めない（呼び出し側で try/catch）。
  *
- * @param {Array<Object>} txns
+ * @param {Array<Object>} txns 明細（Komoju を含む）
+ * @return {number} 商品名を補完できた件数
  */
 function wixEnrichKomojuTxns_(txns) {
-  if (!isWixEnabled_()) return;
-  const cache = {}; // code -> productLabel|null
+  if (!isWixEnabled_()) return 0;
+
+  // 対象Komojuの最も古い日付を基準に、その少し前まで支払いを取得
+  let minDate = null;
   txns.forEach(function (t) {
-    if (t.source !== 'Komoju') return;
-    const code = String(t.product || '');
-    if (!code) return;
-    if (!(code in cache)) {
-      const order = wixGetOrderById_(code);
-      cache[code] = order ? wixOrderProductLabel_(order) : null;
-    }
-    if (cache[code]) {
-      if (!t.orderId) t.orderId = code; // 元コードを残す
-      t.product = cache[code];
+    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
+  });
+  if (!minDate) return 0;
+  const from = new Date(minDate.getTime() - 4 * 86400000);
+
+  const wtx = wixListTransactionsUntil_(from);
+  const byProv = {};      // providerTransactionId -> 商品名
+  const byAmtDate = {};   // "金額|yyyy-MM-dd" -> [商品名...]（Stripe以外）
+  wtx.forEach(function (w) {
+    const name = wixTxProductName_(w);
+    if (!name) return;
+    if (w.providerTransactionId) byProv[String(w.providerTransactionId)] = name;
+    if (!wixIsStripeTx_(w)) {
+      const amt = w.amount ? Math.round(w.amount.amount) : '';
+      const d = w.createdAt ? Utilities.formatDate(new Date(w.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '';
+      const key = amt + '|' + d;
+      (byAmtDate[key] = byAmtDate[key] || []).push(name);
     }
   });
+
+  let filled = 0;
+  txns.forEach(function (t) {
+    if (t.source !== 'Komoju') return;
+    let name = byProv[String(t.id)];
+    if (!name) {
+      const key = Math.round(t.gross) + '|' + Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd');
+      const cand = byAmtDate[key];
+      if (cand && cand.length === 1) name = cand[0];
+      else if (cand && cand.length > 1 && allSame_(cand)) name = cand[0];
+    }
+    if (name) {
+      if (!t.orderId) t.orderId = String(t.id);
+      t.product = name;
+      filled++;
+    }
+  });
+  return filled;
+}
+
+function allSame_(arr) {
+  for (let i = 1; i < arr.length; i++) if (arr[i] !== arr[0]) return false;
+  return true;
 }

@@ -14,7 +14,8 @@ function onOpen() {
     .createMenu('売上レポート')
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
-    .addItem('②-2 Komojuを仕分ける（手動タグ付け）', 'openKomojuAssign')
+    .addItem('②-2 KomojuにWixの商品名を反映（自動）', 'applyWixNamesToKomoju')
+    .addItem('②-3 Komojuを仕分ける（手動・保険用）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -335,6 +336,36 @@ function regenerateReports() {
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/**
+ * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する
+ * （再取得なし）。金額＋日付／決済IDで突き合わせる。
+ */
+function applyWixNamesToKomoju() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const all = readLedger_(ss);
+  const komoju = all.filter(function (t) { return t.source === 'Komoju'; });
+  if (!komoju.length) { ui.alert('台帳にKomoju明細がありません。先に「③/④」で取得してください。'); return; }
+
+  let filled = 0;
+  try {
+    filled = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
+  } catch (e) {
+    ui.alert('Wix突き合わせでエラー ❌\n\n' + e.message);
+    return;
+  }
+  rewriteLedger_(ss, all);
+  regenerateReports();
+
+  const samples = komoju.filter(function (t) { return !/^[0-9a-f-]{20,}$/.test(String(t.product)); })
+    .slice(0, 5).map(function (t) { return '  ' + t.gross + '円 → ' + t.product; });
+  ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
+    '商品名を補完: ' + filled + ' / ' + komoju.length + ' 件\n' +
+    (samples.length ? '\n例:\n' + samples.join('\n') : '') +
+    '\n\n※ 補完できなかった分は「②-3 手動タグ付け」で対応できます。');
 }
 
 /** Komoju仕分けシートを開く（未分類を最新化して表示） */

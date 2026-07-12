@@ -106,6 +106,22 @@ function deleteRowsFor_(sh, cols, yearMonth, sources) {
   return keep.length;
 }
 
+/** 明細台帳を丸ごと書き直す（既存データを消して txns で上書き）。 */
+function rewriteLedger_(ss, txns) {
+  const sh = ensureSheetWithHeader_(ss, SHEETS.LEDGER, LEDGER_COLS);
+  const last = sh.getLastRow();
+  if (last >= 2) sh.getRange(2, 1, last - 1, LEDGER_COLS.length).clearContent();
+  if (!txns.length) return;
+  const rows = txns.map(function (t) {
+    return [
+      t.source, t.id, toIso_(t.date), t.yearMonth || formatYm_(t.date), t.kind, t.type,
+      t.product, t.orderId, t.method, t.gross, t.fee, t.net,
+      t.payoutId, t.payoutDate ? toIso_(t.payoutDate) : '',
+    ];
+  });
+  sh.getRange(2, 1, rows.length, LEDGER_COLS.length).setValues(rows);
+}
+
 /** 明細台帳を全件読み込み、txn オブジェクトの配列で返す */
 function readLedger_(ss) {
   const sh = ss.getSheetByName(SHEETS.LEDGER);

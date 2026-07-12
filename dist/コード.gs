@@ -385,6 +385,22 @@ function deleteRowsFor_(sh, cols, yearMonth, sources) {
   return keep.length;
 }
 
+/** 明細台帳を丸ごと書き直す（既存データを消して txns で上書き）。 */
+function rewriteLedger_(ss, txns) {
+  const sh = ensureSheetWithHeader_(ss, SHEETS.LEDGER, LEDGER_COLS);
+  const last = sh.getLastRow();
+  if (last >= 2) sh.getRange(2, 1, last - 1, LEDGER_COLS.length).clearContent();
+  if (!txns.length) return;
+  const rows = txns.map(function (t) {
+    return [
+      t.source, t.id, toIso_(t.date), t.yearMonth || formatYm_(t.date), t.kind, t.type,
+      t.product, t.orderId, t.method, t.gross, t.fee, t.net,
+      t.payoutId, t.payoutDate ? toIso_(t.payoutDate) : '',
+    ];
+  });
+  sh.getRange(2, 1, rows.length, LEDGER_COLS.length).setValues(rows);
+}
+
 /** 明細台帳を全件読み込み、txn オブジェクトの配列で返す */
 function readLedger_(ss) {
   const sh = ss.getSheetByName(SHEETS.LEDGER);
@@ -1104,29 +1120,111 @@ function wixOrderProductLabel_(order) {
   return names[0] + ' 他' + (names.length - 1) + '点';
 }
 
+// ---------------------------------------------------------------------------
+// Wix「支払い(Payments)」トランザクションからの商品名補完
+//   /payments/v2/transactions に、金額・日付・商品名・決済代行ID が揃っている。
+//   これを Komoju 明細と突き合わせて商品名を自動で埋める。
+// ---------------------------------------------------------------------------
+
+/** 支払いトランザクションを新しい順に取得し、fromDate より古くなったら停止 */
+function wixListTransactionsUntil_(fromDate) {
+  const out = [];
+  let cursor = null;
+  let guard = 0;
+  while (guard < 80) {
+    guard++;
+    let path = '/payments/v2/transactions?cursorPaging.limit=100';
+    if (cursor) path += '&cursorPaging.cursor=' + encodeURIComponent(cursor);
+    const r = wixTry_('get', path, null);
+    if (r.status !== 200) break;
+    let j;
+    try { j = JSON.parse(r.text); } catch (e) { break; }
+    const txs = j.transactions || [];
+    if (!txs.length) break;
+    txs.forEach(function (t) { out.push(t); });
+
+    // このページの最古が fromDate より前なら、以降はもっと古いので停止
+    const last = txs[txs.length - 1];
+    const lastDate = last.createdAt ? new Date(last.createdAt) : null;
+    if (lastDate && lastDate.getTime() < fromDate.getTime()) break;
+
+    const meta = j.pagingMetadata || j.metadata || {};
+    cursor = (meta.cursors && meta.cursors.next) || meta.nextCursor || null;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+/** 支払いトランザクションから商品名ラベルを作る */
+function wixTxProductName_(tx) {
+  const items = (tx.order && tx.order.description && tx.order.description.items) || [];
+  const names = items.map(function (it) { return it.name; }).filter(function (s) { return s; });
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  return names[0] + ' 他' + (names.length - 1) + '点';
+}
+
+function wixIsStripeTx_(tx) {
+  return String(tx.provider || '').toLowerCase().indexOf('stripe') !== -1;
+}
+
 /**
- * Komoju 明細の商品名を Wix の商品名で補う（Wix未設定なら何もしない）。
- * 元の注文コードは orderId 列に残す。全体を try/catch で守り、Wix側の
- * 不調で本体処理が止まらないようにする。
+ * Komoju 明細の商品名を、Wixの支払いトランザクションから補完する。
+ * 突き合わせ:  ① 決済代行ID（providerTransactionId＝Komoju決済ID）で厳密一致
+ *              ② 金額＋日付（Stripe以外の支払いに限定）で一致
+ * Wix未設定・不調でも本体処理は止めない（呼び出し側で try/catch）。
  *
- * @param {Array<Object>} txns
+ * @param {Array<Object>} txns 明細（Komoju を含む）
+ * @return {number} 商品名を補完できた件数
  */
 function wixEnrichKomojuTxns_(txns) {
-  if (!isWixEnabled_()) return;
-  const cache = {}; // code -> productLabel|null
+  if (!isWixEnabled_()) return 0;
+
+  // 対象Komojuの最も古い日付を基準に、その少し前まで支払いを取得
+  let minDate = null;
   txns.forEach(function (t) {
-    if (t.source !== 'Komoju') return;
-    const code = String(t.product || '');
-    if (!code) return;
-    if (!(code in cache)) {
-      const order = wixGetOrderById_(code);
-      cache[code] = order ? wixOrderProductLabel_(order) : null;
-    }
-    if (cache[code]) {
-      if (!t.orderId) t.orderId = code; // 元コードを残す
-      t.product = cache[code];
+    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
+  });
+  if (!minDate) return 0;
+  const from = new Date(minDate.getTime() - 4 * 86400000);
+
+  const wtx = wixListTransactionsUntil_(from);
+  const byProv = {};      // providerTransactionId -> 商品名
+  const byAmtDate = {};   // "金額|yyyy-MM-dd" -> [商品名...]（Stripe以外）
+  wtx.forEach(function (w) {
+    const name = wixTxProductName_(w);
+    if (!name) return;
+    if (w.providerTransactionId) byProv[String(w.providerTransactionId)] = name;
+    if (!wixIsStripeTx_(w)) {
+      const amt = w.amount ? Math.round(w.amount.amount) : '';
+      const d = w.createdAt ? Utilities.formatDate(new Date(w.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '';
+      const key = amt + '|' + d;
+      (byAmtDate[key] = byAmtDate[key] || []).push(name);
     }
   });
+
+  let filled = 0;
+  txns.forEach(function (t) {
+    if (t.source !== 'Komoju') return;
+    let name = byProv[String(t.id)];
+    if (!name) {
+      const key = Math.round(t.gross) + '|' + Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd');
+      const cand = byAmtDate[key];
+      if (cand && cand.length === 1) name = cand[0];
+      else if (cand && cand.length > 1 && allSame_(cand)) name = cand[0];
+    }
+    if (name) {
+      if (!t.orderId) t.orderId = String(t.id);
+      t.product = name;
+      filled++;
+    }
+  });
+  return filled;
+}
+
+function allSame_(arr) {
+  for (let i = 1; i < arr.length; i++) if (arr[i] !== arr[0]) return false;
+  return true;
 }
 
 
@@ -1514,7 +1612,8 @@ function onOpen() {
     .createMenu('売上レポート')
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
-    .addItem('②-2 Komojuを仕分ける（手動タグ付け）', 'openKomojuAssign')
+    .addItem('②-2 KomojuにWixの商品名を反映（自動）', 'applyWixNamesToKomoju')
+    .addItem('②-3 Komojuを仕分ける（手動・保険用）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -1835,6 +1934,36 @@ function regenerateReports() {
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/**
+ * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する
+ * （再取得なし）。金額＋日付／決済IDで突き合わせる。
+ */
+function applyWixNamesToKomoju() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const all = readLedger_(ss);
+  const komoju = all.filter(function (t) { return t.source === 'Komoju'; });
+  if (!komoju.length) { ui.alert('台帳にKomoju明細がありません。先に「③/④」で取得してください。'); return; }
+
+  let filled = 0;
+  try {
+    filled = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
+  } catch (e) {
+    ui.alert('Wix突き合わせでエラー ❌\n\n' + e.message);
+    return;
+  }
+  rewriteLedger_(ss, all);
+  regenerateReports();
+
+  const samples = komoju.filter(function (t) { return !/^[0-9a-f-]{20,}$/.test(String(t.product)); })
+    .slice(0, 5).map(function (t) { return '  ' + t.gross + '円 → ' + t.product; });
+  ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
+    '商品名を補完: ' + filled + ' / ' + komoju.length + ' 件\n' +
+    (samples.length ? '\n例:\n' + samples.join('\n') : '') +
+    '\n\n※ 補完できなかった分は「②-3 手動タグ付け」で対応できます。');
 }
 
 /** Komoju仕分けシートを開く（未分類を最新化して表示） */
