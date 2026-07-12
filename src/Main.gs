@@ -22,8 +22,58 @@ function onOpen() {
     .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
     .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
     .addSeparator()
+    .addItem('🔍 Komoju接続テスト', 'testKomoju')
+    .addItem('🔍 Stripe接続テスト', 'testStripe')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
+function testKomoju() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isKomojuEnabled_()) {
+    ui.alert('Komojuのキーが未設定です。「①」で非公開鍵（シークレットキー）を入れてください。');
+    return;
+  }
+  try {
+    const q = buildQuery_([['per_page', 5], ['limit', 5], ['page', 1]]);
+    const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
+    const data = json.data || [];
+    let msg = 'Komoju 接続OK ✅\n';
+    msg += '登録されている決済の総件数: ' + (json.total != null ? json.total : '不明') + '\n';
+    msg += '取得できたサンプル: ' + data.length + ' 件\n';
+    if (data.length) {
+      const p = data[0];
+      msg += '\n［最新1件の中身］\n';
+      msg += '日付: ' + (p.created_at || p.captured_at || '?') + '\n';
+      msg += '金額: ' + p.amount + ' 円\n';
+      msg += 'ステータス: ' + p.status + '\n';
+      msg += '決済手段: ' + (p.payment_details && p.payment_details.type) + '\n';
+      msg += '商品/説明: ' + (p.description || p.external_order_num || '(なし)');
+    } else {
+      msg += '\n※ 決済が0件です。テスト環境の店舗キーになっていないかご確認ください。';
+    }
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('Komoju 接続エラー ❌\n\n' + e.message +
+      '\n\nキーの種類（非公開鍵か）・店舗が正しいかご確認ください。');
+  }
+}
+
+/** Stripe への接続確認。 */
+function testStripe() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isStripeEnabled_()) {
+    ui.alert('Stripeのキーが未設定です。「①」で rk_live_... を入れてください。');
+    return;
+  }
+  try {
+    const json = httpGetJson_(STRIPE_BASE + '/payouts?' + buildQuery_([['limit', 3]]), stripeHeaders_());
+    const n = (json.data || []).length;
+    ui.alert('Stripe 接続OK ✅\n直近の入金(payout)を ' + n + ' 件確認できました。');
+  } catch (e) {
+    ui.alert('Stripe 接続エラー ❌\n\n' + e.message);
+  }
 }
 
 /** 先月分を取得して台帳へ反映 */

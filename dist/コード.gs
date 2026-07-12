@@ -609,31 +609,29 @@ function komojuHeaders_() {
 function komojuCollect_(from, to) {
   const txns = [];
   const feeRate = getKomojuFeeRate_();
-  let page = 1;
   const perPage = 100;
 
-  // ページ送り。古い決済まで遡りすぎないよう、period より前に十分入ったら停止。
-  // （Komoju は created_at 降順で返すため、period 開始より古いページが続いたら打ち切る）
-  let stop = false;
-  while (!stop && page <= 200) {
-    const q = buildQuery_([['limit', perPage], ['page', page]]);
+  // 並び順に依存せず、全ページを走査して period 内の決済だけ拾う。
+  // （Komoju の返す並び順が新しい順とは限らないため、途中で打ち切らない）
+  let page = 1, fetched = 0, total = null;
+  while (page <= 500) {
+    const q = buildQuery_([['per_page', perPage], ['limit', perPage], ['page', page]]);
     const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
     const data = json.data || [];
     if (!data.length) break;
 
-    let allOlderThanPeriod = true;
     data.forEach(function (p) {
       const created = komojuParseDate_(p.created_at || p.captured_at);
-      if (!created) return;
-      if (created.getTime() >= from.getTime()) allOlderThanPeriod = false;
-      if (created.getTime() >= from.getTime() && created.getTime() <= to.getTime()) {
+      if (created && created.getTime() >= from.getTime() && created.getTime() <= to.getTime()) {
         pushKomojuTxns_(txns, p, created, feeRate);
       }
     });
 
-    // このページが全て period 開始より古ければ、これ以降も古いので停止
-    if (allOlderThanPeriod) stop = true;
-    if (data.length < perPage) stop = true;
+    fetched += data.length;
+    if (typeof json.total === 'number') total = json.total;
+    const respPer = (typeof json.per_page === 'number' && json.per_page > 0) ? json.per_page : data.length;
+    if (total != null && fetched >= total) break; // 全件取得しきった
+    if (data.length < respPer) break;             // 最終ページ
     page++;
   }
 
@@ -642,11 +640,11 @@ function komojuCollect_(from, to) {
 
 /** 1つの Komoju payment を、売上（+必要なら返金）明細に変換して push */
 function pushKomojuTxns_(out, p, created, feeRate) {
-  // 対象は成立した決済のみ
-  const status = p.status || '';
-  if (status && ['captured', 'authorized', 'settled'].indexOf(status) === -1 &&
-      !(p.amount_refunded > 0)) {
-    // captured 等でなく返金も無ければスキップ
+  // 未成立・失敗・キャンセル等（お金が動いていないもの）だけ除外し、
+  // それ以外（captured / authorized / refunded など）は売上として扱う。
+  const status = String(p.status || '').toLowerCase();
+  const DEAD = ['failed', 'cancelled', 'canceled', 'expired', 'pending'];
+  if (DEAD.indexOf(status) !== -1 && !(p.amount_refunded > 0)) {
     return;
   }
 
@@ -1127,8 +1125,58 @@ function onOpen() {
     .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
     .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
     .addSeparator()
+    .addItem('🔍 Komoju接続テスト', 'testKomoju')
+    .addItem('🔍 Stripe接続テスト', 'testStripe')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
+}
+
+/** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
+function testKomoju() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isKomojuEnabled_()) {
+    ui.alert('Komojuのキーが未設定です。「①」で非公開鍵（シークレットキー）を入れてください。');
+    return;
+  }
+  try {
+    const q = buildQuery_([['per_page', 5], ['limit', 5], ['page', 1]]);
+    const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
+    const data = json.data || [];
+    let msg = 'Komoju 接続OK ✅\n';
+    msg += '登録されている決済の総件数: ' + (json.total != null ? json.total : '不明') + '\n';
+    msg += '取得できたサンプル: ' + data.length + ' 件\n';
+    if (data.length) {
+      const p = data[0];
+      msg += '\n［最新1件の中身］\n';
+      msg += '日付: ' + (p.created_at || p.captured_at || '?') + '\n';
+      msg += '金額: ' + p.amount + ' 円\n';
+      msg += 'ステータス: ' + p.status + '\n';
+      msg += '決済手段: ' + (p.payment_details && p.payment_details.type) + '\n';
+      msg += '商品/説明: ' + (p.description || p.external_order_num || '(なし)');
+    } else {
+      msg += '\n※ 決済が0件です。テスト環境の店舗キーになっていないかご確認ください。';
+    }
+    ui.alert(msg);
+  } catch (e) {
+    ui.alert('Komoju 接続エラー ❌\n\n' + e.message +
+      '\n\nキーの種類（非公開鍵か）・店舗が正しいかご確認ください。');
+  }
+}
+
+/** Stripe への接続確認。 */
+function testStripe() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isStripeEnabled_()) {
+    ui.alert('Stripeのキーが未設定です。「①」で rk_live_... を入れてください。');
+    return;
+  }
+  try {
+    const json = httpGetJson_(STRIPE_BASE + '/payouts?' + buildQuery_([['limit', 3]]), stripeHeaders_());
+    const n = (json.data || []).length;
+    ui.alert('Stripe 接続OK ✅\n直近の入金(payout)を ' + n + ' 件確認できました。');
+  } catch (e) {
+    ui.alert('Stripe 接続エラー ❌\n\n' + e.message);
+  }
 }
 
 /** 先月分を取得して台帳へ反映 */

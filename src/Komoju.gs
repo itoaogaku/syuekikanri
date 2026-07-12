@@ -34,31 +34,29 @@ function komojuHeaders_() {
 function komojuCollect_(from, to) {
   const txns = [];
   const feeRate = getKomojuFeeRate_();
-  let page = 1;
   const perPage = 100;
 
-  // ページ送り。古い決済まで遡りすぎないよう、period より前に十分入ったら停止。
-  // （Komoju は created_at 降順で返すため、period 開始より古いページが続いたら打ち切る）
-  let stop = false;
-  while (!stop && page <= 200) {
-    const q = buildQuery_([['limit', perPage], ['page', page]]);
+  // 並び順に依存せず、全ページを走査して period 内の決済だけ拾う。
+  // （Komoju の返す並び順が新しい順とは限らないため、途中で打ち切らない）
+  let page = 1, fetched = 0, total = null;
+  while (page <= 500) {
+    const q = buildQuery_([['per_page', perPage], ['limit', perPage], ['page', page]]);
     const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
     const data = json.data || [];
     if (!data.length) break;
 
-    let allOlderThanPeriod = true;
     data.forEach(function (p) {
       const created = komojuParseDate_(p.created_at || p.captured_at);
-      if (!created) return;
-      if (created.getTime() >= from.getTime()) allOlderThanPeriod = false;
-      if (created.getTime() >= from.getTime() && created.getTime() <= to.getTime()) {
+      if (created && created.getTime() >= from.getTime() && created.getTime() <= to.getTime()) {
         pushKomojuTxns_(txns, p, created, feeRate);
       }
     });
 
-    // このページが全て period 開始より古ければ、これ以降も古いので停止
-    if (allOlderThanPeriod) stop = true;
-    if (data.length < perPage) stop = true;
+    fetched += data.length;
+    if (typeof json.total === 'number') total = json.total;
+    const respPer = (typeof json.per_page === 'number' && json.per_page > 0) ? json.per_page : data.length;
+    if (total != null && fetched >= total) break; // 全件取得しきった
+    if (data.length < respPer) break;             // 最終ページ
     page++;
   }
 
@@ -67,11 +65,11 @@ function komojuCollect_(from, to) {
 
 /** 1つの Komoju payment を、売上（+必要なら返金）明細に変換して push */
 function pushKomojuTxns_(out, p, created, feeRate) {
-  // 対象は成立した決済のみ
-  const status = p.status || '';
-  if (status && ['captured', 'authorized', 'settled'].indexOf(status) === -1 &&
-      !(p.amount_refunded > 0)) {
-    // captured 等でなく返金も無ければスキップ
+  // 未成立・失敗・キャンセル等（お金が動いていないもの）だけ除外し、
+  // それ以外（captured / authorized / refunded など）は売上として扱う。
+  const status = String(p.status || '').toLowerCase();
+  const DEAD = ['failed', 'cancelled', 'canceled', 'expired', 'pending'];
+  if (DEAD.indexOf(status) !== -1 && !(p.amount_refunded > 0)) {
     return;
   }
 
