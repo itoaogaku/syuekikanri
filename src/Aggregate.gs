@@ -102,15 +102,20 @@ function buildByKey_(txns, fyList, keyFn, labelField) {
     const map = out[t.fy];
     const key = keyFn(t);
     if (!map[key]) {
-      map[key] = { source: t.source, label: t[labelField], agg: emptyAgg_() };
+      map[key] = { source: t.source, label: t[labelField], agg: emptyAgg_(), biz: {} };
     }
     addTxn_(map[key].agg, t);
+    if (t.business) map[key].biz[t.business] = true;
   });
   // 各年度を配列（売上降順）に整形
   const arr = {};
   fyList.forEach(function (fy) {
     arr[fy] = Object.keys(out[fy])
-      .map(function (k) { return out[fy][k]; })
+      .map(function (k) {
+        const g = out[fy][k];
+        g.business = Object.keys(g.biz).join(' / ');
+        return g;
+      })
       .sort(function (a, b) { return b.agg.gross - a.agg.gross; });
   });
   return arr;

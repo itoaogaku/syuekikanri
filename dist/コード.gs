@@ -1483,15 +1483,20 @@ function buildByKey_(txns, fyList, keyFn, labelField) {
     const map = out[t.fy];
     const key = keyFn(t);
     if (!map[key]) {
-      map[key] = { source: t.source, label: t[labelField], agg: emptyAgg_() };
+      map[key] = { source: t.source, label: t[labelField], agg: emptyAgg_(), biz: {} };
     }
     addTxn_(map[key].agg, t);
+    if (t.business) map[key].biz[t.business] = true;
   });
   // 各年度を配列（売上降順）に整形
   const arr = {};
   fyList.forEach(function (fy) {
     arr[fy] = Object.keys(out[fy])
-      .map(function (k) { return out[fy][k]; })
+      .map(function (k) {
+        const g = out[fy][k];
+        g.business = Object.keys(g.biz).join(' / ');
+        return g;
+      })
       .sort(function (a, b) { return b.agg.gross - a.agg.gross; });
   });
   return arr;
@@ -1654,21 +1659,21 @@ function writeProductSheet_(ss, reports) {
   reports.fyList.forEach(function (fy) {
     sh.getRange(r++, 1).setValue('■ ' + fiscalYearLabel_(fy))
       .setFontWeight('bold').setFontSize(12).setFontColor('#1a56db');
-    const header = ['決済', '商品／注文', '件数', '売上（総額）', '返金', '手数料', '純額'];
+    const header = ['決済', '商品／注文', '事業', '件数', '売上（総額）', '返金', '手数料', '純額'];
     sh.getRange(r, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#e8eef7');
     r++;
     const list = reports.byProduct[fy];
     const rows = list.map(function (x) {
-      return [x.source, x.label, x.agg.count, x.agg.gross, x.agg.refund, x.agg.fee, x.agg.net];
+      return [x.source, x.label, x.business || '未分類', x.agg.count, x.agg.gross, x.agg.refund, x.agg.fee, x.agg.net];
     });
     if (rows.length) {
       sh.getRange(r, 1, rows.length, header.length).setValues(rows);
-      sh.getRange(r, 4, rows.length, 4).setNumberFormat(YEN_FMT);
+      sh.getRange(r, 5, rows.length, 4).setNumberFormat(YEN_FMT);
       r += rows.length;
     }
     r += 2;
   });
-  autoSize_(sh, 7);
+  autoSize_(sh, 8);
 }
 
 /** === 決済手段別（年度ごと） === */
