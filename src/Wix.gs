@@ -160,6 +160,57 @@ function wixProbePurchases_() {
   return results;
 }
 
+/** 支払い取引のページ送り方法を特定する診断。 */
+function wixProbeTxPaging_() {
+  const out = [];
+  const p1 = wixTry_('get', '/payments/v2/transactions', null);
+  let j1 = {};
+  try { j1 = JSON.parse(p1.text); } catch (e) { }
+  const t1 = j1.transactions || [];
+  const pag = j1.pagination || {};
+  out.push({ label: 'page1(パラメータ無)', status: p1.status, count: t1.length, note: 'pagination=' + JSON.stringify(pag).slice(0, 500) });
+  const firstId1 = t1.length ? (t1[0].transactionId || '') : '';
+
+  // pagination の中から cursor らしき文字列を探す
+  const cursors = [];
+  (function scan(o) {
+    if (!o || typeof o !== 'object') return;
+    for (const k in o) {
+      const v = o[k];
+      if (typeof v === 'string' && v.length >= 8 && /cursor|next|token/i.test(k)) cursors.push(v);
+      else if (v && typeof v === 'object') scan(v);
+    }
+  })(pag);
+  const cur = cursors[0] || '';
+  out.push({ label: '見つけたカーソル', status: '', count: cursors.length, note: cur.slice(0, 60) });
+
+  const attempts = [
+    ['limit=100', '/payments/v2/transactions?limit=100'],
+    ['paging.limit=100', '/payments/v2/transactions?paging.limit=100'],
+    ['cursorPaging.limit=100', '/payments/v2/transactions?cursorPaging.limit=100'],
+  ];
+  if (cur) {
+    const e = encodeURIComponent(cur);
+    attempts.push(['cursor=', '/payments/v2/transactions?cursor=' + e]);
+    attempts.push(['cursorPaging.cursor=', '/payments/v2/transactions?cursorPaging.cursor=' + e]);
+    attempts.push(['pagination.cursor=', '/payments/v2/transactions?pagination.cursor=' + e]);
+    attempts.push(['paging.cursor=', '/payments/v2/transactions?paging.cursor=' + e]);
+  }
+  attempts.forEach(function (a) {
+    const r = wixTry_('get', a[1], null);
+    let j = {};
+    try { j = JSON.parse(r.text); } catch (e) { }
+    const tx = j.transactions || [];
+    const dates = tx.map(function (t) { return t.createdAt; }).filter(Boolean).sort();
+    const changed = tx.length && firstId1 && (tx[0].transactionId !== firstId1);
+    out.push({
+      label: a[0], status: r.status, count: tx.length,
+      note: (changed ? '★別ページ ' : '同じ/空 ') + (dates[0] || '') + '〜' + (dates[dates.length - 1] || ''),
+    });
+  });
+  return out;
+}
+
 /** Wixの「支払い(Payments)」「フォーム(Forms)」系エンドポイント候補を試す。診断用。 */
 function wixProbePayments_() {
   const cands = [

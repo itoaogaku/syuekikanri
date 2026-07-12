@@ -32,6 +32,7 @@ function onOpen() {
     .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
     .addItem('🔍 Wix支払い/フォームを調べる（診断）', 'testWixPayments')
     .addItem('🔍 Wix取引とKomojuを並べる（診断）', 'dumpWixTransactions')
+    .addItem('🔍 Wix支払いのページ送りを調べる（診断）', 'testWixTxPaging')
     .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
 }
@@ -337,6 +338,26 @@ function regenerateReports() {
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/** 支払い取引のページ送り方法を特定して「Wixページ診断」に書き出す。 */
+function testWixTxPaging() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const results = wixProbeTxPaging_();
+  let sh = ss.getSheetByName('Wixページ診断');
+  if (!sh) sh = ss.insertSheet('Wixページ診断');
+  sh.clear();
+  const header = ['試した内容', 'ステータス', '件数', 'メモ'];
+  sh.getRange(1, 1, 1, 4).setValues([header]).setFontWeight('bold');
+  const rows = results.map(function (r) { return [r.label, r.status, r.count, r.note]; });
+  sh.getRange(2, 1, rows.length, 4).setValues(rows);
+  ss.setActiveSheet(sh);
+  let msg = 'ページ送りを調べました。\n';
+  results.forEach(function (r) { msg += '・' + r.label + ' : ' + r.count + '件 ' + (r.note || '') + '\n'; });
+  msg += '\n「Wixページ診断」シートも共有ください。';
+  ui.alert(msg);
 }
 
 /** Wixの支払いデータとKomoju明細を並べて「Wix取引診断」に書き出す（原因調査用）。 */
