@@ -14,6 +14,7 @@ function onOpen() {
     .createMenu('売上レポート')
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
+    .addItem('②-2 Komojuを仕分ける（手動タグ付け）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -286,6 +287,11 @@ function runReportForMonth_(year, month1) {
   upsertLedger_(ss, txns, yearMonth, fetchedSources);
   upsertPayoutLedger_(ss, payouts, yearMonth, fetchedSources);
 
+  // Komojuの新しい注文コードを仕分けシートへ追記（未分類として）
+  if (fetchedSources.indexOf('Komoju') !== -1) {
+    try { refreshKomojuAssign_(ss); } catch (e) { /* 継続 */ }
+  }
+
   regenerateReports();
 
   ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
@@ -297,9 +303,22 @@ function regenerateReports() {
   const txns = readLedger_(ss);
   const payouts = readPayoutLedger_(ss);
   const rules = loadBusinessRules_(ss);
-  const reports = buildReports_(txns, rules, payouts);
+  const komojuAssign = loadKomojuAssign_(ss);
+  const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/** Komoju仕分けシートを開く（未分類を最新化して表示） */
+function openKomojuAssign() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const r = refreshKomojuAssign_(ss);
+  ss.setActiveSheet(ss.getSheetByName(SHEETS.KOMOJU_ASSIGN));
+  SpreadsheetApp.getUi().alert(
+    'Komoju仕分けシートを開きました。\n\n' +
+    '「事業」列をプルダウンで選んでください（商品名の記入は任意）。\n' +
+    '新規追加: ' + r.added + ' 件 ／ 未割り当て（空欄）: ' + r.blank + ' 件\n\n' +
+    '選び終えたら「⑤ レポートを再作成」で反映されます。');
 }
 
 /** 事業マッピングシートを開く（無ければ作成） */

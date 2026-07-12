@@ -94,3 +94,98 @@ function classifyBusiness_(txn, rules) {
   }
   return '未分類';
 }
+
+// ---------------------------------------------------------------------------
+// Komoju の手動タグ付け（注文コード → 事業・商品名 を人が割り当てる）
+// ---------------------------------------------------------------------------
+
+const KOMOJU_ASSIGN_COLS = ['注文コード', '日付', '金額', '決済手段', '事業', '商品名'];
+
+/** 仕分けシートを用意（無ければ見出しを作成） */
+function ensureKomojuAssignSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.KOMOJU_ASSIGN);
+  if (sh) return sh;
+  sh = ss.insertSheet(SHEETS.KOMOJU_ASSIGN);
+  sh.getRange(1, 1, 1, KOMOJU_ASSIGN_COLS.length).setValues([KOMOJU_ASSIGN_COLS])
+    .setFontWeight('bold').setBackground('#e8eef7');
+  sh.setFrozenRows(1);
+  sh.getRange(1, 8).setValue('← 「事業」列を選ぶだけでOK（商品名は任意）。選んだ内容は記憶され、翌月は新規分だけ増えます。')
+    .setFontColor('#888888');
+  sh.setColumnWidth(1, 300);
+  return sh;
+}
+
+/**
+ * 台帳のKomoju注文コードのうち、仕分けシートに未登録のものを追記する。
+ * 既存の割り当て（事業・商品名）は保持。
+ * @return {{added:number, blank:number}}
+ */
+function refreshKomojuAssign_(ss) {
+  const sh = ensureKomojuAssignSheet_(ss);
+  const last = sh.getLastRow();
+  const existing = {};
+  if (last >= 2) {
+    const codes = sh.getRange(2, 1, last - 1, 1).getValues();
+    codes.forEach(function (r) { if (r[0]) existing[String(r[0])] = true; });
+  }
+
+  // 台帳のKomoju行から、コード単位で代表情報を集める
+  const txns = readLedger_(ss).filter(function (t) { return t.source === 'Komoju' && t.kind === 'sale'; });
+  const newRows = [];
+  const seen = {};
+  txns.forEach(function (t) {
+    const code = String(t.orderId || t.product || '');
+    if (!code || existing[code] || seen[code]) return;
+    seen[code] = true;
+    newRows.push([
+      code,
+      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy/MM/dd'),
+      t.gross,
+      t.method,
+      '', '',
+    ]);
+  });
+  if (newRows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, KOMOJU_ASSIGN_COLS.length).setValues(newRows);
+    sh.getRange(2, 3, sh.getLastRow() - 1, 1).setNumberFormat('#,##0" 円"');
+  }
+
+  // 「事業」列にプルダウン（事業マッピングの事業名から）
+  applyBusinessDropdown_(ss, sh);
+
+  // 空欄（未割り当て）の数を数える
+  let blank = 0;
+  const lr = sh.getLastRow();
+  if (lr >= 2) {
+    const biz = sh.getRange(2, 5, lr - 1, 1).getValues();
+    biz.forEach(function (r) { if (!String(r[0]).trim()) blank++; });
+  }
+  return { added: newRows.length, blank: blank };
+}
+
+/** 「事業」列にプルダウン（事業マッピングの事業名一覧）を設定 */
+function applyBusinessDropdown_(ss, sh) {
+  const rules = loadBusinessRules_(ss);
+  const names = {};
+  rules.forEach(function (r) { names[r.business] = true; });
+  const list = Object.keys(names);
+  const lr = sh.getLastRow();
+  if (!list.length || lr < 2) return;
+  const rule = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(true).build();
+  sh.getRange(2, 5, lr - 1, 1).setDataValidation(rule);
+}
+
+/** 仕分けシートを読み、コード→{business, product} のマップを返す */
+function loadKomojuAssign_(ss) {
+  const sh = ss.getSheetByName(SHEETS.KOMOJU_ASSIGN);
+  const map = {};
+  if (!sh || sh.getLastRow() < 2) return map;
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, KOMOJU_ASSIGN_COLS.length).getValues();
+  rows.forEach(function (r) {
+    const code = String(r[0] || '').trim();
+    const business = String(r[4] || '').trim();
+    const product = String(r[5] || '').trim();
+    if (code && (business || product)) map[code] = { business: business, product: product };
+  });
+  return map;
+}

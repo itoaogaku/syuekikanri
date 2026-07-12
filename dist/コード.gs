@@ -27,6 +27,7 @@ const SHEETS = {
   LEDGER: '明細DB',             // ★全取引を蓄積する台帳（元データ・年間で追記されていく）
   PAYOUTS: '入金DB',            // ★入金(payout)を蓄積する台帳
   MAPPING: '事業マッピング',      // キーワード→事業名 の対応表（ユーザーが編集）
+  KOMOJU_ASSIGN: 'Komoju仕分け', // Komojuの手動タグ付け（注文コード→事業・商品名）
 };
 
 /** スクリプトプロパティのキー名 */
@@ -175,6 +176,101 @@ function classifyBusiness_(txn, rules) {
     if (hay.indexOf(rules[i].keyword.toLowerCase()) !== -1) return rules[i].business;
   }
   return '未分類';
+}
+
+// ---------------------------------------------------------------------------
+// Komoju の手動タグ付け（注文コード → 事業・商品名 を人が割り当てる）
+// ---------------------------------------------------------------------------
+
+const KOMOJU_ASSIGN_COLS = ['注文コード', '日付', '金額', '決済手段', '事業', '商品名'];
+
+/** 仕分けシートを用意（無ければ見出しを作成） */
+function ensureKomojuAssignSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.KOMOJU_ASSIGN);
+  if (sh) return sh;
+  sh = ss.insertSheet(SHEETS.KOMOJU_ASSIGN);
+  sh.getRange(1, 1, 1, KOMOJU_ASSIGN_COLS.length).setValues([KOMOJU_ASSIGN_COLS])
+    .setFontWeight('bold').setBackground('#e8eef7');
+  sh.setFrozenRows(1);
+  sh.getRange(1, 8).setValue('← 「事業」列を選ぶだけでOK（商品名は任意）。選んだ内容は記憶され、翌月は新規分だけ増えます。')
+    .setFontColor('#888888');
+  sh.setColumnWidth(1, 300);
+  return sh;
+}
+
+/**
+ * 台帳のKomoju注文コードのうち、仕分けシートに未登録のものを追記する。
+ * 既存の割り当て（事業・商品名）は保持。
+ * @return {{added:number, blank:number}}
+ */
+function refreshKomojuAssign_(ss) {
+  const sh = ensureKomojuAssignSheet_(ss);
+  const last = sh.getLastRow();
+  const existing = {};
+  if (last >= 2) {
+    const codes = sh.getRange(2, 1, last - 1, 1).getValues();
+    codes.forEach(function (r) { if (r[0]) existing[String(r[0])] = true; });
+  }
+
+  // 台帳のKomoju行から、コード単位で代表情報を集める
+  const txns = readLedger_(ss).filter(function (t) { return t.source === 'Komoju' && t.kind === 'sale'; });
+  const newRows = [];
+  const seen = {};
+  txns.forEach(function (t) {
+    const code = String(t.orderId || t.product || '');
+    if (!code || existing[code] || seen[code]) return;
+    seen[code] = true;
+    newRows.push([
+      code,
+      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy/MM/dd'),
+      t.gross,
+      t.method,
+      '', '',
+    ]);
+  });
+  if (newRows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, KOMOJU_ASSIGN_COLS.length).setValues(newRows);
+    sh.getRange(2, 3, sh.getLastRow() - 1, 1).setNumberFormat('#,##0" 円"');
+  }
+
+  // 「事業」列にプルダウン（事業マッピングの事業名から）
+  applyBusinessDropdown_(ss, sh);
+
+  // 空欄（未割り当て）の数を数える
+  let blank = 0;
+  const lr = sh.getLastRow();
+  if (lr >= 2) {
+    const biz = sh.getRange(2, 5, lr - 1, 1).getValues();
+    biz.forEach(function (r) { if (!String(r[0]).trim()) blank++; });
+  }
+  return { added: newRows.length, blank: blank };
+}
+
+/** 「事業」列にプルダウン（事業マッピングの事業名一覧）を設定 */
+function applyBusinessDropdown_(ss, sh) {
+  const rules = loadBusinessRules_(ss);
+  const names = {};
+  rules.forEach(function (r) { names[r.business] = true; });
+  const list = Object.keys(names);
+  const lr = sh.getLastRow();
+  if (!list.length || lr < 2) return;
+  const rule = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(true).build();
+  sh.getRange(2, 5, lr - 1, 1).setDataValidation(rule);
+}
+
+/** 仕分けシートを読み、コード→{business, product} のマップを返す */
+function loadKomojuAssign_(ss) {
+  const sh = ss.getSheetByName(SHEETS.KOMOJU_ASSIGN);
+  const map = {};
+  if (!sh || sh.getLastRow() < 2) return map;
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, KOMOJU_ASSIGN_COLS.length).getValues();
+  rows.forEach(function (r) {
+    const code = String(r[0] || '').trim();
+    const business = String(r[4] || '').trim();
+    const product = String(r[5] || '').trim();
+    if (code && (business || product)) map[code] = { business: business, product: product };
+  });
+  return map;
 }
 
 
@@ -1046,11 +1142,15 @@ function addTxn_(acc, t) {
  * @param {Array<Object>} payouts 入金台帳
  * @return {Object}
  */
-function buildReports_(txns, rules, payouts) {
+function buildReports_(txns, rules, payouts, komojuAssign) {
+  const assign = komojuAssign || {};
   // 各取引に年度と事業を付与
   txns.forEach(function (t) {
     t.fy = fiscalYearOf_(t.date);
-    t.business = classifyBusiness_(t, rules);
+    // Komojuの手動タグ付けがあれば優先（商品名も上書き）
+    const a = t.source === 'Komoju' ? assign[String(t.orderId || t.product || '')] : null;
+    if (a && a.product) t.product = a.product;
+    t.business = (a && a.business) ? a.business : classifyBusiness_(t, rules);
   });
 
   const fySet = {};
@@ -1392,6 +1492,7 @@ function onOpen() {
     .createMenu('売上レポート')
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
+    .addItem('②-2 Komojuを仕分ける（手動タグ付け）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -1664,6 +1765,11 @@ function runReportForMonth_(year, month1) {
   upsertLedger_(ss, txns, yearMonth, fetchedSources);
   upsertPayoutLedger_(ss, payouts, yearMonth, fetchedSources);
 
+  // Komojuの新しい注文コードを仕分けシートへ追記（未分類として）
+  if (fetchedSources.indexOf('Komoju') !== -1) {
+    try { refreshKomojuAssign_(ss); } catch (e) { /* 継続 */ }
+  }
+
   regenerateReports();
 
   ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
@@ -1675,9 +1781,22 @@ function regenerateReports() {
   const txns = readLedger_(ss);
   const payouts = readPayoutLedger_(ss);
   const rules = loadBusinessRules_(ss);
-  const reports = buildReports_(txns, rules, payouts);
+  const komojuAssign = loadKomojuAssign_(ss);
+  const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
   ss.toast('レポートを再作成しました。', '完了', 4);
+}
+
+/** Komoju仕分けシートを開く（未分類を最新化して表示） */
+function openKomojuAssign() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const r = refreshKomojuAssign_(ss);
+  ss.setActiveSheet(ss.getSheetByName(SHEETS.KOMOJU_ASSIGN));
+  SpreadsheetApp.getUi().alert(
+    'Komoju仕分けシートを開きました。\n\n' +
+    '「事業」列をプルダウンで選んでください（商品名の記入は任意）。\n' +
+    '新規追加: ' + r.added + ' 件 ／ 未割り当て（空欄）: ' + r.blank + ' 件\n\n' +
+    '選び終えたら「⑤ レポートを再作成」で反映されます。');
 }
 
 /** 事業マッピングシートを開く（無ければ作成） */

@@ -29,11 +29,15 @@ function addTxn_(acc, t) {
  * @param {Array<Object>} payouts 入金台帳
  * @return {Object}
  */
-function buildReports_(txns, rules, payouts) {
+function buildReports_(txns, rules, payouts, komojuAssign) {
+  const assign = komojuAssign || {};
   // 各取引に年度と事業を付与
   txns.forEach(function (t) {
     t.fy = fiscalYearOf_(t.date);
-    t.business = classifyBusiness_(t, rules);
+    // Komojuの手動タグ付けがあれば優先（商品名も上書き）
+    const a = t.source === 'Komoju' ? assign[String(t.orderId || t.product || '')] : null;
+    if (a && a.product) t.product = a.product;
+    t.business = (a && a.business) ? a.business : classifyBusiness_(t, rules);
   });
 
   const fySet = {};
