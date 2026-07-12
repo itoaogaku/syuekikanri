@@ -128,19 +128,54 @@ function wixTry_(method, path, body) {
 
 /** Wixイベント系エンドポイントの候補を順に試す。診断用。 */
 function wixProbeEvents_() {
-  const probes = [
-    ['events一覧(GET v1)', 'get', '/events/v1/events', null],
-    ['events query(v1)', 'post', '/events/v1/events/query', { query: { paging: { limit: 3 } } }],
-    ['events query(v3)', 'post', '/events/v3/events/query', { query: { cursorPaging: { limit: 3 } } }],
-    ['orders query(v1)', 'post', '/events/v1/orders/query', { query: { paging: { limit: 3 } } }],
-    ['orders search(v3)', 'post', '/events/v3/orders/search', { search: { cursorPaging: { limit: 3 } } }],
-    ['orders(GET v2)', 'get', '/events/v2/orders?limit=3', null],
-    ['ticket orders(v2)', 'post', '/events/v2/orders/query', { query: { paging: { limit: 3 } } }],
+  const results = [];
+
+  // (1) イベント一覧を、取得方法を変えて複数試し、中身が取れたものからIDと名前を得る
+  const listAttempts = [
+    ['events GET ?limit=50', 'get', '/events/v1/events?limit=50', null],
+    ['events query v1 {query.paging}', 'post', '/events/v1/events/query', { query: { paging: { limit: 50 } } }],
+    ['events query v1 {paging}', 'post', '/events/v1/events/query', { paging: { limit: 50 } }],
+    ['events query v3 {query.paging}', 'post', '/events/v3/events/query', { query: { paging: { limit: 50 } } }],
+    ['events query v3 {cursorPaging}', 'post', '/events/v3/events/query', { cursorPaging: { limit: 50 } }],
   ];
-  return probes.map(function (p) {
-    const r = wixTry_(p[1], p[2], p[3]);
-    return { label: p[0], method: p[1], path: p[2], status: r.status, text: r.text };
+  let eid = null;
+  const names = [];
+  listAttempts.forEach(function (a) {
+    const r = wixTry_(a[1], a[2], a[3]);
+    let cnt = 0;
+    try {
+      const j = JSON.parse(r.text);
+      const arr = j.events || [];
+      cnt = arr.length;
+      if (!eid && arr.length) {
+        eid = arr[0].id;
+        arr.slice(0, 8).forEach(function (e) {
+          names.push(e.title || (e.eventInfo && e.eventInfo.title) || e.name || '?');
+        });
+      }
+    } catch (e) { /* ignore */ }
+    results.push({ label: a[0] + ' [' + cnt + '件]', method: a[1], path: a[2], status: r.status, text: r.text });
   });
+  results.push({ label: '（イベント名サンプル）', method: '', path: '参考', status: names.length, text: JSON.stringify(names) });
+
+  // (2) 注文（オーダー）の入口候補。イベントIDが取れていれば event 別も試す
+  const cands = [
+    ['orders query(v3)', 'post', '/events/v3/orders/query', { query: { cursorPaging: { limit: 3 } } }],
+    ['orders query(v1)', 'post', '/events/v1/orders/query', { query: { paging: { limit: 3 } } }],
+    ['ticket-orders query(v1)', 'post', '/events/v1/ticket-orders/query', { query: { paging: { limit: 3 } } }],
+  ];
+  if (eid) {
+    cands.push(['event orders query(v1)', 'post', '/events/v1/orders/query', { eventId: [eid], query: { paging: { limit: 3 } } }]);
+    cands.push(['event orders query(v3)', 'post', '/events/v3/orders/query', { eventId: [eid], query: { cursorPaging: { limit: 3 } } }]);
+    cands.push(['event別 orders(GET)', 'get', '/events/v1/events/' + eid + '/orders', null]);
+    cands.push(['event別 tickets(GET)', 'get', '/events/v1/events/' + eid + '/tickets', null]);
+  }
+  cands.forEach(function (c) {
+    const r = wixTry_(c[1], c[2], c[3]);
+    results.push({ label: c[0], method: c[1], path: c[2], status: r.status, text: r.text });
+  });
+
+  return results;
 }
 
 /** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
