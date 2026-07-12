@@ -216,9 +216,12 @@ function refreshKomojuAssign_(ss) {
   const txns = readLedger_(ss).filter(function (t) { return t.source === 'Komoju' && t.kind === 'sale'; });
   const newRows = [];
   const seen = {};
+  // 商品名がまだ記号（UUID）のまま＝自動補完できなかった行だけを対象にする
+  const looksLikeCode = function (s) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/i.test(String(s || '')); };
   txns.forEach(function (t) {
     const code = String(t.orderId || t.product || '');
     if (!code || existing[code] || seen[code]) return;
+    if (!looksLikeCode(t.product)) return; // 既に商品名が付いている行は仕分け不要
     seen[code] = true;
     newRows.push([
       code,
