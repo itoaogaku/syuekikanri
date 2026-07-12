@@ -40,37 +40,38 @@ function testWix() {
     return;
   }
   try {
-    const orders = wixSearchOrders_(100);
-    const byId = {}, byNum = {};
-    orders.forEach(function (o) {
-      byId[o.id] = o;
-      if (o.number != null) byNum[String(o.number)] = o;
-    });
+    let msg = 'Wix 接続OK ✅\n';
 
-    let msg = 'Wix 接続OK ✅\n取得できた注文: ' + orders.length + ' 件\n';
-    if (orders.length) {
-      const o = orders[0];
-      msg += '\n［最新注文の例］\n注文ID: ' + o.id + '\n注文番号: ' + o.number +
-        '\n商品名: ' + (wixOrderProductLabel_(o) || '(なし)') + '\n';
-    }
-
-    // 台帳のKomojuコードと一致するか
+    // 台帳のKomojuコードで、Wixの注文を「直接1件取得」できるか試す（これが本番と同じ方式）
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
-    let matched = 0;
-    const samples = [];
-    komoju.forEach(function (t) {
-      const code = String(t.product);
-      const o = byId[code] || byNum[code];
-      if (o) {
-        matched++;
-        if (samples.length < 3) samples.push('  ' + code.slice(0, 12) + '… → ' + wixOrderProductLabel_(o));
-      }
-    });
-    msg += '\nKomoju注文コードとの一致: ' + matched + ' / ' + komoju.length + ' 件';
-    if (samples.length) msg += '\n' + samples.join('\n');
-    else if (komoju.length) msg += '\n（一致なし：取得注文数を増やすか、突き合わせ方法の調整が必要かもしれません）';
+    if (!komoju.length) {
+      msg += '\n台帳にKomojuデータがありません。先に「④」でKomojuのある月を取得してください。';
+      ui.alert(msg);
+      return;
+    }
 
+    const tryCount = Math.min(komoju.length, 8);
+    let ok = 0;
+    const samples = [];
+    for (let i = 0; i < tryCount; i++) {
+      const code = String(komoju[i].orderId || komoju[i].product);
+      const order = wixGetOrderById_(code);
+      if (order) {
+        ok++;
+        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → ' + (wixOrderProductLabel_(order) || '(商品名なし)'));
+      } else {
+        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → 見つからず');
+      }
+    }
+    msg += '\nKomojuコードでWix注文を取得できた数: ' + ok + ' / ' + tryCount + ' 件（試行）\n';
+    msg += samples.join('\n');
+    if (ok === 0) {
+      msg += '\n\n→ Komojuのコードは Wix の注文ID とは別物のようです。' +
+        '別の突き合わせ方法（注文番号や金額＋日付）を検討します。結果を共有してください。';
+    } else {
+      msg += '\n\n→ 取得できています！「④」で対象月を取り直すと、Komojuに商品名が入ります。';
+    }
     ui.alert(msg);
   } catch (e) {
     ui.alert('Wix 接続エラー ❌\n\n' + e.message +
