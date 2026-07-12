@@ -372,18 +372,26 @@ function wixIsStripeTx_(tx) {
  */
 function wixEnrichKomojuTxns_(txns) {
   if (!isWixEnabled_()) return 0;
-
   // 対象Komojuの最も古い日付を基準に、その少し前まで支払いを取得
   let minDate = null;
   txns.forEach(function (t) {
     if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
   });
   if (!minDate) return 0;
-  const from = new Date(minDate.getTime() - 4 * 86400000);
+  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
+  return wixApplyKomojuIndex_(txns, index);
+}
 
-  const wtx = wixListTransactionsUntil_(from);
-  const byProv = {};       // providerTransactionId -> 商品名（全provider）
-  const nonStripe = [];    // Stripe以外の取引（金額＋日付で突き合わせる候補）
+/**
+ * 支払いトランザクションから突き合わせ用の索引を1回だけ作る。
+ * （一括取り込みで各月に使い回すため、build と apply を分離）
+ * @param {Date} fromDate ここより新しい取引まで取得
+ * @return {{byProv:Object, nonStripe:Array}}
+ */
+function wixBuildTxIndex_(fromDate) {
+  const wtx = wixListTransactionsUntil_(fromDate);
+  const byProv = {};      // providerTransactionId -> 商品名（全provider）
+  const nonStripe = [];   // Stripe以外の取引（金額＋日付で突き合わせる候補）
   wtx.forEach(function (w) {
     const name = wixTxProductName_(w);
     if (!name) return;
@@ -396,7 +404,14 @@ function wixEnrichKomojuTxns_(txns) {
       });
     }
   });
+  return { byProv: byProv, nonStripe: nonStripe };
+}
 
+/** 事前に作った索引を使って Komoju 明細に商品名を付与する。 */
+function wixApplyKomojuIndex_(txns, index) {
+  if (!index) return 0;
+  const byProv = index.byProv || {};
+  const nonStripe = index.nonStripe || [];
   const DAY = 86400000;
   const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
   let filled = 0;
@@ -407,12 +422,12 @@ function wixEnrichKomojuTxns_(txns) {
     if (!name) {
       const amt = Math.round(t.gross);
       const tYmd = ymd(t.date);
-      // ② まず「同じ金額・同じ日付」で照合（最も確実）。商品名が一意なら採用
+      // ② まず「同じ金額・同じ日付」で照合。商品名が一意なら採用
       const sameDay = nonStripe.filter(function (w) {
         return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
       if (sameDay.length && allSame_(sameDay)) name = sameDay[0];
-      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）。一意なら採用
+      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）
       if (!name) {
         const near = nonStripe.filter(function (w) {
           return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;

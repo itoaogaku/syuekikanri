@@ -1236,18 +1236,26 @@ function wixIsStripeTx_(tx) {
  */
 function wixEnrichKomojuTxns_(txns) {
   if (!isWixEnabled_()) return 0;
-
   // 対象Komojuの最も古い日付を基準に、その少し前まで支払いを取得
   let minDate = null;
   txns.forEach(function (t) {
     if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
   });
   if (!minDate) return 0;
-  const from = new Date(minDate.getTime() - 4 * 86400000);
+  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
+  return wixApplyKomojuIndex_(txns, index);
+}
 
-  const wtx = wixListTransactionsUntil_(from);
-  const byProv = {};       // providerTransactionId -> 商品名（全provider）
-  const nonStripe = [];    // Stripe以外の取引（金額＋日付で突き合わせる候補）
+/**
+ * 支払いトランザクションから突き合わせ用の索引を1回だけ作る。
+ * （一括取り込みで各月に使い回すため、build と apply を分離）
+ * @param {Date} fromDate ここより新しい取引まで取得
+ * @return {{byProv:Object, nonStripe:Array}}
+ */
+function wixBuildTxIndex_(fromDate) {
+  const wtx = wixListTransactionsUntil_(fromDate);
+  const byProv = {};      // providerTransactionId -> 商品名（全provider）
+  const nonStripe = [];   // Stripe以外の取引（金額＋日付で突き合わせる候補）
   wtx.forEach(function (w) {
     const name = wixTxProductName_(w);
     if (!name) return;
@@ -1260,7 +1268,14 @@ function wixEnrichKomojuTxns_(txns) {
       });
     }
   });
+  return { byProv: byProv, nonStripe: nonStripe };
+}
 
+/** 事前に作った索引を使って Komoju 明細に商品名を付与する。 */
+function wixApplyKomojuIndex_(txns, index) {
+  if (!index) return 0;
+  const byProv = index.byProv || {};
+  const nonStripe = index.nonStripe || [];
   const DAY = 86400000;
   const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
   let filled = 0;
@@ -1271,12 +1286,12 @@ function wixEnrichKomojuTxns_(txns) {
     if (!name) {
       const amt = Math.round(t.gross);
       const tYmd = ymd(t.date);
-      // ② まず「同じ金額・同じ日付」で照合（最も確実）。商品名が一意なら採用
+      // ② まず「同じ金額・同じ日付」で照合。商品名が一意なら採用
       const sameDay = nonStripe.filter(function (w) {
         return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
       if (sameDay.length && allSame_(sameDay)) name = sameDay[0];
-      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）。一意なら採用
+      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）
       if (!name) {
         const near = nonStripe.filter(function (w) {
           return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
@@ -1688,6 +1703,7 @@ function onOpen() {
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
+    .addItem('④-2 期間を一括取得（複数月）', 'runBulkImport')
     .addItem('⑤ レポートを再作成（取得済みデータから）', 'regenerateReports')
     .addSeparator()
     .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
@@ -1995,6 +2011,92 @@ function runReportForMonth_(year, month1) {
   regenerateReports();
 
   ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
+}
+
+/**
+ * 期間を指定して複数月を一括取得する。
+ * Komoju・Wix支払いは期間分を1回だけ取得して各月へ振り分け（高速化）。
+ * 実行時間の上限（約6分）に近づいたら安全に中断し、続きの期間を案内する。
+ */
+function runBulkImport() {
+  const ui = SpreadsheetApp.getUi();
+  if (!isStripeEnabled_() && !isKomojuEnabled_()) {
+    ui.alert('APIキーが未設定です。「①」から入力してください。');
+    return;
+  }
+  const res = ui.prompt('期間を一括取得',
+    '開始と終了の年月を入力してください（例: 2025-04 〜 2026-03）。\n※一度に取り込むのは2年分くらいまでを目安に。',
+    ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const m = String(res.getResponseText()).match(/(\d{4})[-\/](\d{1,2})\D+(\d{4})[-\/](\d{1,2})/);
+  if (!m) { ui.alert('形式が不正です。例: 2025-04 〜 2026-03'); return; }
+  const sy = +m[1], sm = +m[2], ey = +m[3], em = +m[4];
+
+  // 対象月リストを作成
+  const months = [];
+  let y = sy, mo = sm, guard = 0;
+  while (guard++ < 300) {
+    if (y > ey || (y === ey && mo > em)) break;
+    months.push([y, mo]);
+    mo++; if (mo > 12) { mo = 1; y++; }
+  }
+  if (!months.length) { ui.alert('期間が正しくありません（開始が終了より後です）。'); return; }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const rangeFrom = new Date(sy, sm - 1, 1, 0, 0, 0);
+  const rangeTo = new Date(ey, em, 0, 23, 59, 59);
+
+  // Komoju を期間分まとめて取得し、Wix支払いの索引で商品名を一括付与、月ごとに振り分け
+  const komojuByYm = {};
+  if (isKomojuEnabled_()) {
+    const k = komojuCollect_(rangeFrom, rangeTo);
+    try {
+      if (isWixEnabled_()) {
+        const idx = wixBuildTxIndex_(new Date(rangeFrom.getTime() - 4 * 86400000));
+        wixApplyKomojuIndex_(k.txns, idx);
+      }
+    } catch (e) { /* Wix不調でも継続 */ }
+    k.txns.forEach(function (t) {
+      const ym = Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM');
+      (komojuByYm[ym] = komojuByYm[ym] || []).push(t);
+    });
+  }
+
+  let total = 0, done = 0, stoppedAt = null;
+  const t0 = Date.now();
+  for (let i = 0; i < months.length; i++) {
+    if (Date.now() - t0 > 5 * 60 * 1000) { stoppedAt = months[i]; break; } // 時間切れ前に中断
+    const yy = months[i][0], mm = months[i][1];
+    const from = new Date(yy, mm - 1, 1, 0, 0, 0);
+    const to = new Date(yy, mm, 0, 23, 59, 59);
+    const ym = Utilities.formatDate(from, 'Asia/Tokyo', 'yyyy-MM');
+    let txns = [], payouts = [];
+    const sources = [];
+    if (isStripeEnabled_()) {
+      const s = stripeCollect_(Math.floor(from.getTime() / 1000), Math.floor(to.getTime() / 1000));
+      txns = txns.concat(s.txns);
+      payouts = payouts.concat(s.payouts);
+      sources.push('Stripe');
+    }
+    if (isKomojuEnabled_()) {
+      txns = txns.concat(komojuByYm[ym] || []);
+      sources.push('Komoju');
+    }
+    upsertLedger_(ss, txns, ym, sources);
+    upsertPayoutLedger_(ss, payouts, ym, sources);
+    total += txns.length; done++;
+  }
+
+  try { refreshKomojuAssign_(ss); } catch (e) { }
+  regenerateReports();
+
+  let msg = '一括取得が完了しました。\n取り込んだ月数: ' + done + ' ／ 取引合計: ' + total + ' 件';
+  if (stoppedAt) {
+    const sa = stoppedAt[0] + '-' + ('0' + stoppedAt[1]).slice(-2);
+    msg += '\n\n⚠ 実行時間の都合で ' + sa + ' 以降は未取得です。\n' +
+      'もう一度「④-2」で「' + sa + ' 〜 ' + ey + '-' + ('0' + em).slice(-2) + '」を実行してください（重複はしません）。';
+  }
+  SpreadsheetApp.getUi().alert(msg);
 }
 
 /** 台帳（取得済みデータ）から全レポートを再生成。事業マッピング変更後などに使う。 */
