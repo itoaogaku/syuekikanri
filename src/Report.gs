@@ -268,5 +268,8 @@ function writeSubmissionSheet_(ss, txns) {
     sh.getRange(2, 1, rows.length, header.length).setValues(rows);
     sh.getRange(2, 6, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
   }
+  // 末尾の余分な空白行を削除（提出用に見た目を整える）
+  const need = rows.length + 1;
+  if (sh.getMaxRows() > need) sh.deleteRows(need + 1, sh.getMaxRows() - need);
   autoSize_(sh, header.length);
 }

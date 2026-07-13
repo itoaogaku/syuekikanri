@@ -382,6 +382,19 @@ function wixEnrichKomojuTxns_(txns) {
   return wixApplyKomojuIndex_(txns, index);
 }
 
+/** 商品名を上書きせず、突き合わせ内訳だけ調べる（診断用）。 */
+function wixMatchStats_(txns) {
+  if (!isWixEnabled_()) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  let minDate = null;
+  txns.forEach(function (t) {
+    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
+  });
+  if (!minDate) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
+  const copy = txns.map(function (t) { return { source: t.source, id: t.id, date: t.date, gross: t.gross, product: t.product, orderId: t.orderId }; });
+  return wixApplyKomojuIndex_(copy, index);
+}
+
 /**
  * 支払いトランザクションから突き合わせ用の索引を1回だけ作る。
  * （一括取り込みで各月に使い回すため、build と apply を分離）
@@ -414,11 +427,13 @@ function wixApplyKomojuIndex_(txns, index) {
   const nonStripe = index.nonStripe || [];
   const DAY = 86400000;
   const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
-  let filled = 0;
+  let filled = 0, byId = 0, byAmt = 0, target = 0;
   txns.forEach(function (t) {
     if (t.source !== 'Komoju') return;
+    target++;
     // ① 決済代行ID（Komoju決済ID）で厳密一致
     let name = byProv[String(t.id)];
+    let via = name ? 'id' : '';
     if (!name) {
       const amt = Math.round(t.gross);
       const tYmd = ymd(t.date);
@@ -426,22 +441,23 @@ function wixApplyKomojuIndex_(txns, index) {
       const sameDay = nonStripe.filter(function (w) {
         return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
-      if (sameDay.length && allSame_(sameDay)) name = sameDay[0];
+      if (sameDay.length && allSame_(sameDay)) { name = sameDay[0]; via = 'amt'; }
       // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）
       if (!name) {
         const near = nonStripe.filter(function (w) {
           return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
         }).map(function (w) { return w.name; });
-        if (near.length && allSame_(near)) name = near[0];
+        if (near.length && allSame_(near)) { name = near[0]; via = 'amt'; }
       }
     }
     if (name) {
       if (!t.orderId) t.orderId = String(t.id);
       t.product = name;
       filled++;
+      if (via === 'id') byId++; else byAmt++;
     }
   });
-  return filled;
+  return { filled: filled, byId: byId, byAmt: byAmt, target: target };
 }
 
 function allSame_(arr) {

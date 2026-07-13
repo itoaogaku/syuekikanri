@@ -1309,6 +1309,19 @@ function wixEnrichKomojuTxns_(txns) {
   return wixApplyKomojuIndex_(txns, index);
 }
 
+/** 商品名を上書きせず、突き合わせ内訳だけ調べる（診断用）。 */
+function wixMatchStats_(txns) {
+  if (!isWixEnabled_()) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  let minDate = null;
+  txns.forEach(function (t) {
+    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
+  });
+  if (!minDate) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
+  const copy = txns.map(function (t) { return { source: t.source, id: t.id, date: t.date, gross: t.gross, product: t.product, orderId: t.orderId }; });
+  return wixApplyKomojuIndex_(copy, index);
+}
+
 /**
  * 支払いトランザクションから突き合わせ用の索引を1回だけ作る。
  * （一括取り込みで各月に使い回すため、build と apply を分離）
@@ -1341,11 +1354,13 @@ function wixApplyKomojuIndex_(txns, index) {
   const nonStripe = index.nonStripe || [];
   const DAY = 86400000;
   const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
-  let filled = 0;
+  let filled = 0, byId = 0, byAmt = 0, target = 0;
   txns.forEach(function (t) {
     if (t.source !== 'Komoju') return;
+    target++;
     // ① 決済代行ID（Komoju決済ID）で厳密一致
     let name = byProv[String(t.id)];
+    let via = name ? 'id' : '';
     if (!name) {
       const amt = Math.round(t.gross);
       const tYmd = ymd(t.date);
@@ -1353,22 +1368,23 @@ function wixApplyKomojuIndex_(txns, index) {
       const sameDay = nonStripe.filter(function (w) {
         return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
-      if (sameDay.length && allSame_(sameDay)) name = sameDay[0];
+      if (sameDay.length && allSame_(sameDay)) { name = sameDay[0]; via = 'amt'; }
       // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）
       if (!name) {
         const near = nonStripe.filter(function (w) {
           return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
         }).map(function (w) { return w.name; });
-        if (near.length && allSame_(near)) name = near[0];
+        if (near.length && allSame_(near)) { name = near[0]; via = 'amt'; }
       }
     }
     if (name) {
       if (!t.orderId) t.orderId = String(t.id);
       t.product = name;
       filled++;
+      if (via === 'id') byId++; else byAmt++;
     }
   });
-  return filled;
+  return { filled: filled, byId: byId, byAmt: byAmt, target: target };
 }
 
 function allSame_(arr) {
@@ -1777,6 +1793,9 @@ function writeSubmissionSheet_(ss, txns) {
     sh.getRange(2, 1, rows.length, header.length).setValues(rows);
     sh.getRange(2, 6, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
   }
+  // 末尾の余分な空白行を削除（提出用に見た目を整える）
+  const need = rows.length + 1;
+  if (sh.getMaxRows() > need) sh.deleteRows(need + 1, sh.getMaxRows() - need);
   autoSize_(sh, header.length);
 }
 
@@ -2346,9 +2365,9 @@ function applyWixNamesToKomoju() {
   const komoju = all.filter(function (t) { return t.source === 'Komoju'; });
   if (!komoju.length) { ui.alert('台帳にKomoju明細がありません。先に「③/④」で取得してください。'); return; }
 
-  let filled = 0;
+  let r = { filled: 0, byId: 0, byAmt: 0 };
   try {
-    filled = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
+    r = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
   } catch (e) {
     ui.alert('Wix突き合わせでエラー ❌\n\n' + e.message);
     return;
@@ -2356,12 +2375,12 @@ function applyWixNamesToKomoju() {
   rewriteLedger_(ss, all);
   regenerateReports();
 
-  const samples = komoju.filter(function (t) { return !/^[0-9a-f-]{20,}$/.test(String(t.product)); })
-    .slice(0, 5).map(function (t) { return '  ' + t.gross + '円 → ' + t.product; });
   ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
-    '商品名を補完: ' + filled + ' / ' + komoju.length + ' 件\n' +
-    (samples.length ? '\n例:\n' + samples.join('\n') : '') +
-    '\n\n※ 補完できなかった分は「②-3 手動タグ付け」で対応できます。');
+    '商品名を補完: ' + r.filled + ' / ' + komoju.length + ' 件\n' +
+    '　- 決済IDで一致: ' + r.byId + ' 件\n' +
+    '　- 金額＋日付で一致: ' + r.byAmt + ' 件\n' +
+    '　- 未補完: ' + (komoju.length - r.filled) + ' 件\n\n' +
+    '※ 未補完（同額・同日で商品を特定できない分）は「②-3 手動タグ付け」で対応できます。');
 }
 
 /** Komoju仕分けシートを開く（未分類を最新化して表示） */

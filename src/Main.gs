@@ -560,9 +560,9 @@ function applyWixNamesToKomoju() {
   const komoju = all.filter(function (t) { return t.source === 'Komoju'; });
   if (!komoju.length) { ui.alert('台帳にKomoju明細がありません。先に「③/④」で取得してください。'); return; }
 
-  let filled = 0;
+  let r = { filled: 0, byId: 0, byAmt: 0 };
   try {
-    filled = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
+    r = wixEnrichKomojuTxns_(komoju); // komoju は all 内の同じ参照を書き換える
   } catch (e) {
     ui.alert('Wix突き合わせでエラー ❌\n\n' + e.message);
     return;
@@ -570,12 +570,12 @@ function applyWixNamesToKomoju() {
   rewriteLedger_(ss, all);
   regenerateReports();
 
-  const samples = komoju.filter(function (t) { return !/^[0-9a-f-]{20,}$/.test(String(t.product)); })
-    .slice(0, 5).map(function (t) { return '  ' + t.gross + '円 → ' + t.product; });
   ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
-    '商品名を補完: ' + filled + ' / ' + komoju.length + ' 件\n' +
-    (samples.length ? '\n例:\n' + samples.join('\n') : '') +
-    '\n\n※ 補完できなかった分は「②-3 手動タグ付け」で対応できます。');
+    '商品名を補完: ' + r.filled + ' / ' + komoju.length + ' 件\n' +
+    '　- 決済IDで一致: ' + r.byId + ' 件\n' +
+    '　- 金額＋日付で一致: ' + r.byAmt + ' 件\n' +
+    '　- 未補完: ' + (komoju.length - r.filled) + ' 件\n\n' +
+    '※ 未補完（同額・同日で商品を特定できない分）は「②-3 手動タグ付け」で対応できます。');
 }
 
 /** Komoju仕分けシートを開く（未分類を最新化して表示） */
