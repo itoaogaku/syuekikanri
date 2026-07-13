@@ -464,6 +464,8 @@ function regenerateReports() {
   const komojuAssign = loadKomojuAssign_(ss);
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
+  // buildReports_ で product は Komoju仕分けも反映済み。その txns から提出用明細を作成
+  writeSubmissionSheet_(ss, txns);
   ss.toast('レポートを再作成しました。', '完了', 4);
 }
 

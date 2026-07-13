@@ -238,3 +238,35 @@ function writeReconcileSheet_(ss, payouts) {
 function autoSize_(sh, numCols) {
   for (let c = 1; c <= numCols; c++) sh.autoResizeColumn(c);
 }
+
+/**
+ * 会社提出用の明細シートを書き出す。
+ * 列: source, date, yearMonth, type, product, gross, fee, net, payoutDate
+ * 見出しは日本語。product は Komoju仕分けの内容も反映済み（buildReports_ で上書き済みの txns を渡す）。
+ */
+function writeSubmissionSheet_(ss, txns) {
+  const sh = prepSheet_(ss, SHEETS.SUBMISSION);
+  const header = ['決済サービス', '取引日', '対象月', '種別', '商品名', '売上（総額）', '手数料', '純額', '入金日'];
+  sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#e8eef7');
+  sh.setFrozenRows(1);
+
+  const sorted = (txns || []).slice().sort(function (a, b) { return a.date.getTime() - b.date.getTime(); });
+  const rows = sorted.map(function (t) {
+    return [
+      t.source,
+      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy/MM/dd'),
+      t.yearMonth || Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM'),
+      t.type,
+      t.product,
+      t.gross,
+      t.fee,
+      t.net,
+      t.payoutDate ? Utilities.formatDate(t.payoutDate, 'Asia/Tokyo', 'yyyy/MM/dd') : '',
+    ];
+  });
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+    sh.getRange(2, 6, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
+  }
+  autoSize_(sh, header.length);
+}
