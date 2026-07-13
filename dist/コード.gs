@@ -751,37 +751,6 @@ function komojuSettlementRecord_(s) {
   };
 }
 
-/** 任意の Komoju エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
-function komojuTry_(method, path) {
-  try {
-    const res = UrlFetchApp.fetch(KOMOJU_BASE + path, {
-      method: method, headers: komojuHeaders_(), muteHttpExceptions: true,
-    });
-    return { status: res.getResponseCode(), text: res.getContentText() };
-  } catch (e) {
-    return { status: -1, text: String(e) };
-  }
-}
-
-/** Komojuの精算（入金/振込）データの入口を探す。診断用。 */
-function komojuProbeSettlements_() {
-  const paths = [
-    '/settlements?limit=3',
-    '/payouts?limit=3',
-    '/deposits?limit=3',
-    '/statements?limit=3',
-    '/transfers?limit=3',
-    '/settlement?limit=3',
-    '/merchant_settlements?limit=3',
-    '/settlements',
-    '/payouts',
-  ];
-  return paths.map(function (p) {
-    const r = komojuTry_('get', p);
-    return { path: p, status: r.status, text: r.text };
-  });
-}
-
 /**
  * 期間内の Komoju 決済を取得して正規化。
  * created_at で period に入るものだけを対象にする（クライアント側フィルタ）。
@@ -928,13 +897,16 @@ function komojuParseDate_(s) {
 /**
  * Wix.gs
  * -----------------------------------------------------------------------------
- * Wix eCommerce（注文）API クライアント。
+ * Wix「支払い(Payments)」トランザクション API クライアント。
  *
- * 目的：Komoju の決済は商品名が「注文コード」しか入っていないため、
- *       Wix の注文データから本当の商品名を取得して補う。
+ * 目的：Komoju の決済は商品名が注文コードしか入らないため、Wixの支払いデータ
+ *       （/payments/v2/transactions）から本当の商品名を取得して補う。
+ *       支払いデータには 金額・日付・商品名・決済代行ID が揃っている。
+ *
+ * 突き合わせ：決済代行ID（providerTransactionId）で厳密一致、無ければ
+ *            金額＋日付（Stripe以外・同額の商品名が一意な場合）で一致。
  *
  * 認証：アカウントのAPIキー ＋ サイトID ＋ アカウントID をヘッダで渡す。
- * 参考：https://dev.wix.com/docs/rest/business-solutions/e-commerce/orders
  */
 
 const WIX_BASE = 'https://www.wixapis.com';
@@ -954,294 +926,17 @@ function wixHeaders_() {
   return h;
 }
 
-/** POST して JSON を返す */
-function wixPostJson_(path, body) {
-  const res = UrlFetchApp.fetch(WIX_BASE + path, {
-    method: 'post',
-    headers: wixHeaders_(),
-    payload: JSON.stringify(body || {}),
-    muteHttpExceptions: true,
-  });
-  const code = res.getResponseCode();
-  const text = res.getContentText();
-  if (code < 200 || code >= 300) {
-    throw new Error('Wix HTTP ' + code + ' : ' + path + '\n' + text.slice(0, 500));
-  }
-  return JSON.parse(text);
-}
-
-/**
- * 注文を検索して取得（新しい順）。
- * @param {number} limit 取得件数
- * @return {Array<Object>} order の配列
- */
-function wixSearchOrders_(limit) {
-  const body = {
-    search: {
-      cursorPaging: { limit: limit || 100 },
-      sort: [{ fieldName: 'createdDate', order: 'DESC' }],
-    },
-  };
-  const json = wixPostJson_('/ecom/v1/orders/search', body);
-  return json.orders || [];
-}
-
-/** 注文IDで1件取得（見つからなければ null） */
-function wixGetOrderById_(orderId) {
+/** GET して {status, text} を返す（例外にしない）。 */
+function wixGet_(path) {
   try {
-    const res = UrlFetchApp.fetch(WIX_BASE + '/ecom/v1/orders/' + encodeURIComponent(orderId), {
-      method: 'get',
-      headers: wixHeaders_(),
-      muteHttpExceptions: true,
+    const res = UrlFetchApp.fetch(WIX_BASE + path, {
+      method: 'get', headers: wixHeaders_(), muteHttpExceptions: true,
     });
-    if (res.getResponseCode() !== 200) return null;
-    const json = JSON.parse(res.getContentText());
-    return json.order || json || null;
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * 注文を新しい順にページ送りで取得し、指定日 fromDate より古い注文が
- * 出てきたら停止する（フィルターAPIの書式差異を避けるためクライアント側で絞る）。
- * @param {Date} fromDate これより新しい注文まで取得
- * @return {Array<Object>}
- */
-function wixListOrdersDescUntil_(fromDate) {
-  const out = [];
-  let cursor = null;
-  let guard = 0;
-  while (guard < 60) {
-    guard++;
-    const search = cursor
-      ? { cursorPaging: { limit: 100, cursor: cursor } }
-      : { cursorPaging: { limit: 100 }, sort: [{ fieldName: 'createdDate', order: 'DESC' }] };
-    const json = wixPostJson_('/ecom/v1/orders/search', { search: search });
-    const orders = json.orders || [];
-    if (!orders.length) break;
-    orders.forEach(function (o) { out.push(o); });
-
-    const last = orders[orders.length - 1];
-    const lastDate = new Date(last.createdDate);
-    if (lastDate.getTime() < fromDate.getTime()) break; // これ以降はもっと古い
-
-    const meta = json.metadata || json.pagingMetadata || {};
-    cursor = (meta.cursors || {}).next || null;
-    if (!cursor) break;
-  }
-  return out;
-}
-
-/** 注文の合計金額（数値・円）を返す */
-function wixTotal_(order) {
-  const ps = order.priceSummary || {};
-  const t = ps.total || {};
-  const v = parseFloat(t.amount != null ? t.amount : (order.totals && order.totals.total));
-  return isFinite(v) ? Math.round(v) : '';
-}
-
-/** イベント一覧を取得（中身が取れる GET ?limit 方式）。 */
-function wixListEvents_(limit) {
-  const r = wixTry_('get', '/events/v1/events?limit=' + (limit || 50), null);
-  try { return (JSON.parse(r.text).events) || []; } catch (e) { return []; }
-}
-
-/** イベントの開始日（Date）を取り出す */
-function wixEventStart_(e) {
-  const s = e && e.scheduling && e.scheduling.config && e.scheduling.config.startDate;
-  return s ? new Date(s) : null;
-}
-
-/**
- * 「購入者・注文データ」の入口を、過去の対象イベントに絞って探す診断。
- * tickets / guests など複数の入口を叩き、結果を返す。
- */
-function wixProbePurchases_() {
-  const results = [];
-  const events = wixListEvents_(50);
-  const now = new Date();
-  // 記録挑戦会・大会・対抗戦 で、既に開催済み（＝購入がありそう）なものを対象に
-  const targets = events.filter(function (e) {
-    const t = e.title || '';
-    const start = wixEventStart_(e);
-    const isPast = start ? (start.getTime() < now.getTime()) : true;
-    return /記録挑戦会|対抗戦|大会/.test(t) && isPast;
-  }).slice(0, 3);
-
-  if (!targets.length && events.length) targets.push(events[0]);
-
-  targets.forEach(function (e) {
-    const id = e.id;
-    const eps = [
-      ['tickets(GET)', 'get', '/events/v1/events/' + id + '/tickets?limit=100', null],
-      ['guests(GET)', 'get', '/events/v1/events/' + id + '/guests?limit=100', null],
-      ['guests query v3', 'post', '/events/v3/guests/query', { query: { filter: { eventId: id }, cursorPaging: { limit: 50 } } }],
-      ['guests query v1', 'post', '/events/v1/guests/query', { query: { paging: { limit: 50 }, filter: { eventId: id } } }],
-    ];
-    eps.forEach(function (ep) {
-      const r = wixTry_(ep[1], ep[2], ep[3]);
-      results.push({ label: '[' + (e.title || '').slice(0, 16) + '] ' + ep[0], method: ep[1], path: ep[2], status: r.status, text: r.text });
-    });
-  });
-  return results;
-}
-
-/** 支払い取引のページ送り方法を特定する診断。 */
-function wixProbeTxPaging_() {
-  const out = [];
-  const p1 = wixTry_('get', '/payments/v2/transactions', null);
-  let j1 = {};
-  try { j1 = JSON.parse(p1.text); } catch (e) { }
-  const t1 = j1.transactions || [];
-  const pag = j1.pagination || {};
-  out.push({ label: 'page1(パラメータ無)', status: p1.status, count: t1.length, note: 'pagination=' + JSON.stringify(pag).slice(0, 500) });
-  const firstId1 = t1.length ? (t1[0].transactionId || '') : '';
-
-  // pagination の中から cursor らしき文字列を探す
-  const cursors = [];
-  (function scan(o) {
-    if (!o || typeof o !== 'object') return;
-    for (const k in o) {
-      const v = o[k];
-      if (typeof v === 'string' && v.length >= 8 && /cursor|next|token/i.test(k)) cursors.push(v);
-      else if (v && typeof v === 'object') scan(v);
-    }
-  })(pag);
-  const cur = cursors[0] || '';
-  out.push({ label: '見つけたカーソル', status: '', count: cursors.length, note: cur.slice(0, 60) });
-
-  const attempts = [
-    ['limit=100', '/payments/v2/transactions?limit=100'],
-    ['paging.limit=100', '/payments/v2/transactions?paging.limit=100'],
-    ['cursorPaging.limit=100', '/payments/v2/transactions?cursorPaging.limit=100'],
-  ];
-  if (cur) {
-    const e = encodeURIComponent(cur);
-    attempts.push(['cursor=', '/payments/v2/transactions?cursor=' + e]);
-    attempts.push(['cursorPaging.cursor=', '/payments/v2/transactions?cursorPaging.cursor=' + e]);
-    attempts.push(['pagination.cursor=', '/payments/v2/transactions?pagination.cursor=' + e]);
-    attempts.push(['paging.cursor=', '/payments/v2/transactions?paging.cursor=' + e]);
-  }
-  attempts.forEach(function (a) {
-    const r = wixTry_('get', a[1], null);
-    let j = {};
-    try { j = JSON.parse(r.text); } catch (e) { }
-    const tx = j.transactions || [];
-    const dates = tx.map(function (t) { return t.createdAt; }).filter(Boolean).sort();
-    const changed = tx.length && firstId1 && (tx[0].transactionId !== firstId1);
-    out.push({
-      label: a[0], status: r.status, count: tx.length,
-      note: (changed ? '★別ページ ' : '同じ/空 ') + (dates[0] || '') + '〜' + (dates[dates.length - 1] || ''),
-    });
-  });
-  return out;
-}
-
-/** Wixの「支払い(Payments)」「フォーム(Forms)」系エンドポイント候補を試す。診断用。 */
-function wixProbePayments_() {
-  const cands = [
-    ['payments v2 tx query', 'post', '/payments/v2/transactions/query', { query: { cursorPaging: { limit: 5 } } }],
-    ['payments v1 tx query', 'post', '/payments/v1/transactions/query', { query: { paging: { limit: 5 } } }],
-    ['payments v3 tx search', 'post', '/payments/v3/transactions/search', { search: { cursorPaging: { limit: 5 } } }],
-    ['payments v2 tx GET', 'get', '/payments/v2/transactions?limit=5', null],
-    ['payments v1 tx GET', 'get', '/payments/v1/transactions?limit=5', null],
-    ['cashier tx query', 'post', '/cashier/v1/transactions/query', { query: { paging: { limit: 5 } } }],
-    ['payment-transactions GET', 'get', '/payment-transactions/v1/transactions?limit=5', null],
-    ['ecom payments query', 'post', '/ecom/v1/payments/query', { query: { cursorPaging: { limit: 5 } } }],
-    ['form-submissions v4 query', 'post', '/form-submissions/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
-    ['form-submissions v1 query', 'post', '/form-submissions/v1/submissions/query', { query: { paging: { limit: 5 } } }],
-    ['forms v4 submissions query', 'post', '/forms/v4/submissions/query', { query: { cursorPaging: { limit: 5 } } }],
-    ['form-submissions v4 search', 'post', '/form-submissions/v4/submissions/search', { search: { cursorPaging: { limit: 5 } } }],
-  ];
-  return cands.map(function (c) {
-    const r = wixTry_(c[1], c[2], c[3]);
-    return { label: c[0], method: c[1], path: c[2], status: r.status, text: r.text };
-  });
-}
-
-/** 任意の Wix エンドポイントを叩いて {status, text} を返す（例外にしない）。診断用。 */
-function wixTry_(method, path, body) {
-  try {
-    const opt = { method: method, headers: wixHeaders_(), muteHttpExceptions: true };
-    if (body) opt.payload = JSON.stringify(body);
-    const res = UrlFetchApp.fetch(WIX_BASE + path, opt);
     return { status: res.getResponseCode(), text: res.getContentText() };
   } catch (e) {
     return { status: -1, text: String(e) };
   }
 }
-
-/** Wixイベント系エンドポイントの候補を順に試す。診断用。 */
-function wixProbeEvents_() {
-  const results = [];
-
-  // (1) イベント一覧を、取得方法を変えて複数試し、中身が取れたものからIDと名前を得る
-  const listAttempts = [
-    ['events GET ?limit=50', 'get', '/events/v1/events?limit=50', null],
-    ['events query v1 {query.paging}', 'post', '/events/v1/events/query', { query: { paging: { limit: 50 } } }],
-    ['events query v1 {paging}', 'post', '/events/v1/events/query', { paging: { limit: 50 } }],
-    ['events query v3 {query.paging}', 'post', '/events/v3/events/query', { query: { paging: { limit: 50 } } }],
-    ['events query v3 {cursorPaging}', 'post', '/events/v3/events/query', { cursorPaging: { limit: 50 } }],
-  ];
-  let eid = null;
-  const names = [];
-  listAttempts.forEach(function (a) {
-    const r = wixTry_(a[1], a[2], a[3]);
-    let cnt = 0;
-    try {
-      const j = JSON.parse(r.text);
-      const arr = j.events || [];
-      cnt = arr.length;
-      if (!eid && arr.length) {
-        eid = arr[0].id;
-        arr.slice(0, 8).forEach(function (e) {
-          names.push(e.title || (e.eventInfo && e.eventInfo.title) || e.name || '?');
-        });
-      }
-    } catch (e) { /* ignore */ }
-    results.push({ label: a[0] + ' [' + cnt + '件]', method: a[1], path: a[2], status: r.status, text: r.text });
-  });
-  results.push({ label: '（イベント名サンプル）', method: '', path: '参考', status: names.length, text: JSON.stringify(names) });
-
-  // (2) 注文（オーダー）の入口候補。イベントIDが取れていれば event 別も試す
-  const cands = [
-    ['orders query(v3)', 'post', '/events/v3/orders/query', { query: { cursorPaging: { limit: 3 } } }],
-    ['orders query(v1)', 'post', '/events/v1/orders/query', { query: { paging: { limit: 3 } } }],
-    ['ticket-orders query(v1)', 'post', '/events/v1/ticket-orders/query', { query: { paging: { limit: 3 } } }],
-  ];
-  if (eid) {
-    cands.push(['event orders query(v1)', 'post', '/events/v1/orders/query', { eventId: [eid], query: { paging: { limit: 3 } } }]);
-    cands.push(['event orders query(v3)', 'post', '/events/v3/orders/query', { eventId: [eid], query: { cursorPaging: { limit: 3 } } }]);
-    cands.push(['event別 orders(GET)', 'get', '/events/v1/events/' + eid + '/orders', null]);
-    cands.push(['event別 tickets(GET)', 'get', '/events/v1/events/' + eid + '/tickets', null]);
-  }
-  cands.forEach(function (c) {
-    const r = wixTry_(c[1], c[2], c[3]);
-    results.push({ label: c[0], method: c[1], path: c[2], status: r.status, text: r.text });
-  });
-
-  return results;
-}
-
-/** 注文から商品名のラベルを作る（複数商品なら「〇〇 他N点」） */
-function wixOrderProductLabel_(order) {
-  if (!order) return '';
-  const items = order.lineItems || [];
-  const names = items.map(function (li) {
-    const pn = li.productName || {};
-    return pn.original || pn.translated || li.name || '';
-  }).filter(function (s) { return s; });
-  if (!names.length) return '';
-  if (names.length === 1) return names[0];
-  return names[0] + ' 他' + (names.length - 1) + '点';
-}
-
-// ---------------------------------------------------------------------------
-// Wix「支払い(Payments)」トランザクションからの商品名補完
-//   /payments/v2/transactions に、金額・日付・商品名・決済代行ID が揃っている。
-//   これを Komoju 明細と突き合わせて商品名を自動で埋める。
-// ---------------------------------------------------------------------------
 
 /**
  * 支払いトランザクションを新しい順に取得し、fromDate より古くなったら停止。
@@ -1254,7 +949,7 @@ function wixListTransactionsUntil_(fromDate) {
   let guard = 0;
   while (guard < 300) {
     guard++;
-    const r = wixTry_('get', '/payments/v2/transactions?limit=' + limit + '&offset=' + offset, null);
+    const r = wixGet_('/payments/v2/transactions?limit=' + limit + '&offset=' + offset);
     if (r.status !== 200) break;
     let j;
     try { j = JSON.parse(r.text); } catch (e) { break; }
@@ -1262,7 +957,6 @@ function wixListTransactionsUntil_(fromDate) {
     if (!txs.length) break;
     txs.forEach(function (t) { out.push(t); });
 
-    // このページの最古が fromDate より前なら停止（新しい順のため）
     const last = txs[txs.length - 1];
     const lastDate = last.createdAt ? new Date(last.createdAt) : null;
     if (lastDate && lastDate.getTime() < fromDate.getTime()) break;
@@ -1289,42 +983,7 @@ function wixIsStripeTx_(tx) {
 }
 
 /**
- * Komoju 明細の商品名を、Wixの支払いトランザクションから補完する。
- * 突き合わせ:  ① 決済代行ID（providerTransactionId＝Komoju決済ID）で厳密一致
- *              ② 金額＋日付（Stripe以外の支払いに限定）で一致
- * Wix未設定・不調でも本体処理は止めない（呼び出し側で try/catch）。
- *
- * @param {Array<Object>} txns 明細（Komoju を含む）
- * @return {number} 商品名を補完できた件数
- */
-function wixEnrichKomojuTxns_(txns) {
-  if (!isWixEnabled_()) return 0;
-  // 対象Komojuの最も古い日付を基準に、その少し前まで支払いを取得
-  let minDate = null;
-  txns.forEach(function (t) {
-    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
-  });
-  if (!minDate) return 0;
-  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
-  return wixApplyKomojuIndex_(txns, index);
-}
-
-/** 商品名を上書きせず、突き合わせ内訳だけ調べる（診断用）。 */
-function wixMatchStats_(txns) {
-  if (!isWixEnabled_()) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
-  let minDate = null;
-  txns.forEach(function (t) {
-    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
-  });
-  if (!minDate) return { filled: 0, byId: 0, byAmt: 0, target: 0 };
-  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
-  const copy = txns.map(function (t) { return { source: t.source, id: t.id, date: t.date, gross: t.gross, product: t.product, orderId: t.orderId }; });
-  return wixApplyKomojuIndex_(copy, index);
-}
-
-/**
  * 支払いトランザクションから突き合わせ用の索引を1回だけ作る。
- * （一括取り込みで各月に使い回すため、build と apply を分離）
  * @param {Date} fromDate ここより新しい取引まで取得
  * @return {{byProv:Object, nonStripe:Array}}
  */
@@ -1347,29 +1006,32 @@ function wixBuildTxIndex_(fromDate) {
   return { byProv: byProv, nonStripe: nonStripe };
 }
 
-/** 事前に作った索引を使って Komoju 明細に商品名を付与する。 */
+/**
+ * 事前に作った索引を使って Komoju 明細に商品名を付与する。
+ * @return {{filled:number, byId:number, byAmt:number, target:number}}
+ */
 function wixApplyKomojuIndex_(txns, index) {
-  if (!index) return 0;
+  const stats = { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  if (!index) return stats;
   const byProv = index.byProv || {};
   const nonStripe = index.nonStripe || [];
   const DAY = 86400000;
   const ymd = function (d) { return Utilities.formatDate(d, 'Asia/Tokyo', 'yyyy-MM-dd'); };
-  let filled = 0, byId = 0, byAmt = 0, target = 0;
   txns.forEach(function (t) {
     if (t.source !== 'Komoju') return;
-    target++;
+    stats.target++;
     // ① 決済代行ID（Komoju決済ID）で厳密一致
     let name = byProv[String(t.id)];
     let via = name ? 'id' : '';
     if (!name) {
       const amt = Math.round(t.gross);
       const tYmd = ymd(t.date);
-      // ② まず「同じ金額・同じ日付」で照合。商品名が一意なら採用
+      // ② 同じ金額・同じ日付で照合。商品名が一意なら採用
       const sameDay = nonStripe.filter(function (w) {
         return w.amt === amt && w.date && ymd(w.date) === tYmd;
       }).map(function (w) { return w.name; });
       if (sameDay.length && allSame_(sameDay)) { name = sameDay[0]; via = 'amt'; }
-      // ③ ダメなら「同じ金額・±4日」（コンビニの入金日ズレに対応）
+      // ③ ダメなら同じ金額・±4日（コンビニの入金日ズレに対応）
       if (!name) {
         const near = nonStripe.filter(function (w) {
           return w.amt === amt && w.date && Math.abs(w.date.getTime() - t.date.getTime()) <= 4 * DAY;
@@ -1380,11 +1042,27 @@ function wixApplyKomojuIndex_(txns, index) {
     if (name) {
       if (!t.orderId) t.orderId = String(t.id);
       t.product = name;
-      filled++;
-      if (via === 'id') byId++; else byAmt++;
+      stats.filled++;
+      if (via === 'id') stats.byId++; else stats.byAmt++;
     }
   });
-  return { filled: filled, byId: byId, byAmt: byAmt, target: target };
+  return stats;
+}
+
+/**
+ * Komoju 明細の商品名を、Wixの支払いデータから補完する。
+ * @return {{filled:number, byId:number, byAmt:number, target:number}}
+ */
+function wixEnrichKomojuTxns_(txns) {
+  const empty = { filled: 0, byId: 0, byAmt: 0, target: 0 };
+  if (!isWixEnabled_()) return empty;
+  let minDate = null;
+  txns.forEach(function (t) {
+    if (t.source === 'Komoju' && t.date && (!minDate || t.date.getTime() < minDate.getTime())) minDate = t.date;
+  });
+  if (!minDate) return empty;
+  const index = wixBuildTxIndex_(new Date(minDate.getTime() - 4 * 86400000));
+  return wixApplyKomojuIndex_(txns, index);
 }
 
 function allSame_(arr) {
@@ -1771,7 +1449,7 @@ function autoSize_(sh, numCols) {
  */
 function writeSubmissionSheet_(ss, txns) {
   const sh = prepSheet_(ss, SHEETS.SUBMISSION);
-  const header = ['決済サービス', '取引日', '対象月', '種別', '商品名', '売上（総額）', '手数料', '純額', '入金日'];
+  const header = ['決済サービス', '取引日', '対象月', '種別', '商品名', '事業', '売上（総額）', '手数料', '純額', '入金日'];
   sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#e8eef7');
   sh.setFrozenRows(1);
 
@@ -1783,6 +1461,7 @@ function writeSubmissionSheet_(ss, txns) {
       t.yearMonth || Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM'),
       t.type,
       t.product,
+      t.business || '未分類',
       t.gross,
       t.fee,
       t.net,
@@ -1791,7 +1470,7 @@ function writeSubmissionSheet_(ss, txns) {
   });
   if (rows.length) {
     sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    sh.getRange(2, 6, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
+    sh.getRange(2, 7, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
   }
   // 末尾の余分な空白行を削除（提出用に見た目を整える）
   const need = rows.length + 1;
@@ -1811,7 +1490,7 @@ function writeSubmissionSheet_(ss, txns) {
  *
  * 流れ:
  *   月次実行 → その月の取引を取得 → 台帳（明細DB/入金DB）へ追記・更新
- *          → 台帳全体から 年度サマリー・事業別・商品別・決済手段別・入金照合 を再生成
+ *          → 台帳全体から 年度サマリー・事業別・商品別・決済手段別・入金照合・提出用明細 を再生成
  */
 
 function onOpen() {
@@ -1820,7 +1499,7 @@ function onOpen() {
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
     .addItem('②-2 KomojuにWixの商品名を反映（自動）', 'applyWixNamesToKomoju')
-    .addItem('②-3 Komojuを仕分ける（手動・保険用）', 'openKomojuAssign')
+    .addItem('②-3 Komojuを仕分ける（手動）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -1829,266 +1508,7 @@ function onOpen() {
     .addSeparator()
     .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
     .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
-    .addSeparator()
-    .addItem('🔍 Komoju接続テスト', 'testKomoju')
-    .addItem('🔍 Komoju精算(入金)データを調べる（診断）', 'testKomojuSettlements')
-    .addItem('🔍 Stripe接続テスト', 'testStripe')
-    .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
-    .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
-    .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
-    .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
-    .addItem('🔍 Wix支払い/フォームを調べる（診断）', 'testWixPayments')
-    .addItem('🔍 Wix取引とKomojuを並べる（診断）', 'dumpWixTransactions')
-    .addItem('🔍 Wix支払いのページ送りを調べる（診断）', 'testWixTxPaging')
-    .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
-}
-
-/**
- * Wixイベント系APIにアクセスできるか、有力なエンドポイントを順に試して
- * 「Wixイベント診断」シートに結果（ステータスと応答）を書き出す。
- */
-function testWixEvents() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbeEvents_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wixイベント診断');
-    if (!sh) sh = ss.insertSheet('Wixイベント診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭3000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = results.map(function (r) {
-      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 3000)];
-    });
-    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = 'Wixイベントの入口を ' + results.length + ' 通り試しました。\n';
-    msg += '成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/** Wixの支払い/フォーム系APIの入口を探して「Wix支払い診断」シートに書き出す。 */
-function testWixPayments() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbePayments_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix支払い診断');
-    if (!sh) sh = ss.insertSheet('Wix支払い診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = results.map(function (r) {
-      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
-    });
-    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = '支払い/フォームの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wix支払い診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/** 過去イベントの購入者・注文データの入口を探して「Wix購入診断」シートに書き出す。 */
-function testWixPurchases() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbePurchases_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix購入診断');
-    if (!sh) sh = ss.insertSheet('Wix購入診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    if (results.length) {
-      const rows = results.map(function (r) {
-        return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
-      });
-      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    }
-    ss.setActiveSheet(sh);
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = '購入データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wix購入診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/**
- * 指定月のWix注文を「Wix診断」シートに書き出す。
- * Komojuとの正しい突き合わせ方法を設計するための調査用。
- */
-function dumpWixDiagnostic() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  const res = ui.prompt('Wix注文の書き出し', '対象の年月を入力（例: 2026-06）', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
-  const m = String(res.getResponseText()).match(/^(\d{4})[-\/](\d{1,2})$/);
-  if (!m) { ui.alert('形式が不正です。例: 2026-06'); return; }
-  const y = parseInt(m[1], 10), mo = parseInt(m[2], 10);
-  const from = new Date(y, mo - 1, 1, 0, 0, 0);
-  const to = new Date(y, mo, 0, 23, 59, 59);
-
-  try {
-    const all = wixListOrdersDescUntil_(from);
-    const orders = all.filter(function (o) {
-      const d = new Date(o.createdDate);
-      return d.getTime() >= from.getTime() && d.getTime() <= to.getTime();
-    });
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix診断');
-    if (!sh) sh = ss.insertSheet('Wix診断');
-    sh.clear();
-    const header = ['注文番号', '注文ID', '作成日', '合計金額', '商品名', '生データ(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = orders.map(function (o) {
-      return [o.number, o.id, o.createdDate, wixTotal_(o), wixOrderProductLabel_(o),
-        JSON.stringify(o).slice(0, 4000)];
-    });
-    if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-    ui.alert(orders.length + ' 件のWix注文を「Wix診断」シートに書き出しました。\n' +
-      'このシートを（Komoju明細とあわせて）共有いただければ、正しい紐付けを作ります。');
-  } catch (e) {
-    ui.alert('Wix注文の取得エラー ❌\n\n' + e.message);
-  }
-}
-
-/**
- * Wix への接続確認。Wixの注文を取得し、台帳のKomoju注文コードと
- * 一致するか（＝商品名を補えるか）を確認する。
- */
-function testWix() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) {
-    ui.alert('Wixの APIキー / サイトID が未設定です。「①」から設定してください。');
-    return;
-  }
-  try {
-    let msg = 'Wix 接続OK ✅\n';
-
-    // 台帳のKomojuコードで、Wixの注文を「直接1件取得」できるか試す（これが本番と同じ方式）
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
-    if (!komoju.length) {
-      msg += '\n台帳にKomojuデータがありません。先に「④」でKomojuのある月を取得してください。';
-      ui.alert(msg);
-      return;
-    }
-
-    const tryCount = Math.min(komoju.length, 8);
-    let ok = 0;
-    const samples = [];
-    for (let i = 0; i < tryCount; i++) {
-      const code = String(komoju[i].orderId || komoju[i].product);
-      const order = wixGetOrderById_(code);
-      if (order) {
-        ok++;
-        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → ' + (wixOrderProductLabel_(order) || '(商品名なし)'));
-      } else {
-        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → 見つからず');
-      }
-    }
-    msg += '\nKomojuコードでWix注文を取得できた数: ' + ok + ' / ' + tryCount + ' 件（試行）\n';
-    msg += samples.join('\n');
-    if (ok === 0) {
-      msg += '\n\n→ Komojuのコードは Wix の注文ID とは別物のようです。' +
-        '別の突き合わせ方法（注文番号や金額＋日付）を検討します。結果を共有してください。';
-    } else {
-      msg += '\n\n→ 取得できています！「④」で対象月を取り直すと、Komojuに商品名が入ります。';
-    }
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('Wix 接続エラー ❌\n\n' + e.message +
-      '\n\nAPIキー・サイトID・アカウントID・権限（Orders 読み取り）をご確認ください。');
-  }
-}
-
-/** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
-function testKomoju() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isKomojuEnabled_()) {
-    ui.alert('Komojuのキーが未設定です。「①」で非公開鍵（シークレットキー）を入れてください。');
-    return;
-  }
-  try {
-    const q = buildQuery_([['per_page', 5], ['limit', 5], ['page', 1]]);
-    const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
-    const data = json.data || [];
-    let msg = 'Komoju 接続OK ✅\n';
-    msg += '登録されている決済の総件数: ' + (json.total != null ? json.total : '不明') + '\n';
-    msg += '取得できたサンプル: ' + data.length + ' 件\n';
-    if (data.length) {
-      const p = data[0];
-      msg += '\n［最新1件の中身］\n';
-      msg += '日付: ' + (p.created_at || p.captured_at || '?') + '\n';
-      msg += '金額: ' + p.amount + ' 円\n';
-      msg += 'ステータス: ' + p.status + '\n';
-      msg += '決済手段: ' + (p.payment_details && p.payment_details.type) + '\n';
-      msg += '商品/説明: ' + (p.description || p.external_order_num || '(なし)');
-    } else {
-      msg += '\n※ 決済が0件です。テスト環境の店舗キーになっていないかご確認ください。';
-    }
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('Komoju 接続エラー ❌\n\n' + e.message +
-      '\n\nキーの種類（非公開鍵か）・店舗が正しいかご確認ください。');
-  }
-}
-
-/** Komojuの精算（入金/振込）データの入口を探して「Komoju精算診断」に書き出す。 */
-function testKomojuSettlements() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isKomojuEnabled_()) { ui.alert('Komojuのキーが未設定です。'); return; }
-  const results = komojuProbeSettlements_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName('Komoju精算診断');
-  if (!sh) sh = ss.insertSheet('Komoju精算診断');
-  sh.clear();
-  const header = ['パス', 'ステータス', '応答(先頭3500字)'];
-  sh.getRange(1, 1, 1, 3).setValues([header]).setFontWeight('bold');
-  const rows = results.map(function (r) { return [r.path, r.status, String(r.text).slice(0, 3500)]; });
-  sh.getRange(2, 1, rows.length, 3).setValues(rows);
-  ss.setActiveSheet(sh);
-  const ok = results.filter(function (r) { return r.status === 200; });
-  let msg = 'Komojuの精算データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-  results.forEach(function (r) { msg += '・' + r.path + ' → ' + r.status + '\n'; });
-  msg += '\n詳しい応答は「Komoju精算診断」シートに書き出しました。共有ください。';
-  ui.alert(msg);
-}
-
-/** Stripe への接続確認。 */
-function testStripe() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isStripeEnabled_()) {
-    ui.alert('Stripeのキーが未設定です。「①」で rk_live_... を入れてください。');
-    return;
-  }
-  try {
-    const json = httpGetJson_(STRIPE_BASE + '/payouts?' + buildQuery_([['limit', 3]]), stripeHeaders_());
-    const n = (json.data || []).length;
-    ui.alert('Stripe 接続OK ✅\n直近の入金(payout)を ' + n + ' 件確認できました。');
-  } catch (e) {
-    ui.alert('Stripe 接続エラー ❌\n\n' + e.message);
-  }
 }
 
 /** 先月分を取得して台帳へ反映 */
@@ -2108,9 +1528,7 @@ function runReportForChosenMonth() {
   runReportForMonth_(parseInt(m[1], 10), parseInt(m[2], 10));
 }
 
-/**
- * 指定した年月のデータを取得して台帳へ upsert し、全レポートを再生成。
- */
+/** 指定した年月のデータを取得して台帳へ upsert し、全レポートを再生成。 */
 function runReportForMonth_(year, month1) {
   const from = new Date(year, month1 - 1, 1, 0, 0, 0);
   const to = new Date(year, month1, 0, 23, 59, 59);
@@ -2136,7 +1554,7 @@ function runReportForMonth_(year, month1) {
   }
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(from, to);
-    // Wixが設定されていれば、Komojuの商品名をWixの注文から補う（失敗しても本体は継続）
+    // Wixが設定されていれば、Komojuの商品名をWixの支払いデータから補う（失敗しても継続）
     try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
@@ -2154,14 +1572,13 @@ function runReportForMonth_(year, month1) {
   upsertLedger_(ss, txns, yearMonth, fetchedSources);
   upsertPayoutLedger_(ss, payouts, yearMonth, fetchedSources);
 
-  // Komojuの新しい注文コードを仕分けシートへ追記（未分類として）
+  // Komojuの新しい注文コードを仕分けシートへ追記（未補完のもののみ）
   if (fetchedSources.indexOf('Komoju') !== -1) {
     try { refreshKomojuAssign_(ss); } catch (e) { /* 継続 */ }
   }
 
   regenerateReports();
-
-  ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
+  ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。', '完了', 6);
 }
 
 /**
@@ -2269,93 +1686,14 @@ function regenerateReports() {
   const komojuAssign = loadKomojuAssign_(ss);
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
-  // buildReports_ で product は Komoju仕分けも反映済み。その txns から提出用明細を作成
+  // buildReports_ で product・business は反映済み。その txns から提出用明細を作成
   writeSubmissionSheet_(ss, txns);
   ss.toast('レポートを再作成しました。', '完了', 4);
 }
 
-/** 支払い取引のページ送り方法を特定して「Wixページ診断」に書き出す。 */
-function testWixTxPaging() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const results = wixProbeTxPaging_();
-  let sh = ss.getSheetByName('Wixページ診断');
-  if (!sh) sh = ss.insertSheet('Wixページ診断');
-  sh.clear();
-  const header = ['試した内容', 'ステータス', '件数', 'メモ'];
-  sh.getRange(1, 1, 1, 4).setValues([header]).setFontWeight('bold');
-  const rows = results.map(function (r) { return [r.label, r.status, r.count, r.note]; });
-  sh.getRange(2, 1, rows.length, 4).setValues(rows);
-  ss.setActiveSheet(sh);
-  let msg = 'ページ送りを調べました。\n';
-  results.forEach(function (r) { msg += '・' + r.label + ' : ' + r.count + '件 ' + (r.note || '') + '\n'; });
-  msg += '\n「Wixページ診断」シートも共有ください。';
-  ui.alert(msg);
-}
-
-/** Wixの支払いデータとKomoju明細を並べて「Wix取引診断」に書き出す（原因調査用）。 */
-function dumpWixTransactions() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // 1ページ目を生取得（ページ送りの構造も見る）
-  const r = wixTry_('get', '/payments/v2/transactions?cursorPaging.limit=100', null);
-  let j = {};
-  try { j = JSON.parse(r.text); } catch (e) { }
-  const txs = j.transactions || [];
-  const meta = j.pagingMetadata || j.metadata || {};
-
-  // 台帳のKomoju明細も取得
-  const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
-
-  let sh = ss.getSheetByName('Wix取引診断');
-  if (!sh) sh = ss.insertSheet('Wix取引診断');
-  sh.clear();
-  const rows = [];
-  rows.push(['●メタ情報']);
-  rows.push(['status', r.status]);
-  rows.push(['取得できた取引数(1ページ)', txs.length]);
-  rows.push(['応答のキー', Object.keys(j).join(', ')]);
-  rows.push(['pagingMetadata(生)', JSON.stringify(meta).slice(0, 1500)]);
-  const dates = txs.map(function (t) { return t.createdAt; }).filter(Boolean).sort();
-  rows.push(['取引の日付範囲', (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '')]);
-  rows.push([]);
-  rows.push(['●Wix支払い（provider / 金額 / 日付JST / providerTransactionId / 商品名）']);
-  txs.forEach(function (t) {
-    rows.push([
-      t.provider,
-      t.amount ? t.amount.amount : '',
-      t.createdAt ? Utilities.formatDate(new Date(t.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '',
-      t.providerTransactionId || '',
-      wixTxProductName_(t),
-    ]);
-  });
-  rows.push([]);
-  rows.push(['●Komoju明細（台帳）（id / 金額 / 日付JST / 商品コード）']);
-  komoju.forEach(function (t) {
-    rows.push([
-      t.id,
-      t.gross,
-      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd'),
-      t.product,
-    ]);
-  });
-
-  // 書き込み（列数を揃える）
-  const maxc = 5;
-  const padded = rows.map(function (rw) { while (rw.length < maxc) rw.push(''); return rw.slice(0, maxc); });
-  sh.getRange(1, 1, padded.length, maxc).setValues(padded);
-  ss.setActiveSheet(sh);
-  ui.alert('「Wix取引診断」に書き出しました。\n1ページの取得数: ' + txs.length +
-    '\n日付範囲: ' + (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '') +
-    '\n\nこのシートを共有ください。');
-}
-
 /**
- * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する
- * （再取得なし）。金額＋日付／決済IDで突き合わせる。
+ * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する（再取得なし）。
+ * 金額＋日付／決済IDで突き合わせる。
  */
 function applyWixNamesToKomoju() {
   const ui = SpreadsheetApp.getUi();
@@ -2377,13 +1715,11 @@ function applyWixNamesToKomoju() {
 
   ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
     '商品名を補完: ' + r.filled + ' / ' + komoju.length + ' 件\n' +
-    '　- 決済IDで一致: ' + r.byId + ' 件\n' +
-    '　- 金額＋日付で一致: ' + r.byAmt + ' 件\n' +
     '　- 未補完: ' + (komoju.length - r.filled) + ' 件\n\n' +
     '※ 未補完（同額・同日で商品を特定できない分）は「②-3 手動タグ付け」で対応できます。');
 }
 
-/** Komoju仕分けシートを開く（未分類を最新化して表示） */
+/** Komoju仕分けシートを開く（未補完のものを最新化して表示） */
 function openKomojuAssign() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const r = refreshKomojuAssign_(ss);
@@ -2409,14 +1745,14 @@ function setupApiKeys() {
   const props = PropertiesService.getScriptProperties();
 
   const stripe = ui.prompt('Stripe',
-    'Stripe のシークレットキー（sk_...）を入力。使わない/変更しない場合は空でOK。',
+    'Stripe のシークレットキー（sk_.../rk_...）を入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
   if (stripe.getSelectedButton() === ui.Button.OK && stripe.getResponseText().trim()) {
     props.setProperty(PROP_KEYS.STRIPE_SECRET, stripe.getResponseText().trim());
   }
 
   const komoju = ui.prompt('Komoju',
-    'Komoju のシークレットキーを入力。使わない/変更しない場合は空でOK。',
+    'Komoju のシークレットキー（非公開鍵）を入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
   if (komoju.getSelectedButton() === ui.Button.OK && komoju.getResponseText().trim()) {
     props.setProperty(PROP_KEYS.KOMOJU_SECRET, komoju.getResponseText().trim());
@@ -2477,82 +1813,5 @@ function deleteMonthlyTrigger() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'runLastMonthReport') ScriptApp.deleteTrigger(t);
   });
-}
-
-
-// ====================================================================
-// 以下は Sample.gs の内容
-// ====================================================================
-/**
- * Sample.gs
- * -----------------------------------------------------------------------------
- * APIキーが無くても、蓄積・年度・事業別の見た目を確認できるサンプル。
- * 複数月・2年度・複数事業・Stripe/Komoju をまたいだデータを台帳へ入れて再生成する。
- * メニュー「★ サンプルデータで表示を確認」から実行。
- */
-
-function runSampleReport() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // 既存の台帳をクリア（サンプルを入れ直す）
-  [SHEETS.LEDGER, SHEETS.PAYOUTS].forEach(function (name) {
-    const sh = ss.getSheetByName(name);
-    if (sh) ss.deleteSheet(sh);
-  });
-  ensureMappingSheet_(ss); // 事業マッピングの記入例を用意
-
-  const D = function (y, m, d) { return new Date(y, m - 1, d, 12, 0, 0); };
-  const T = function (source, id, date, kind, product, method, gross, fee, net, payoutId) {
-    return {
-      source: source, id: id, date: date, kind: kind,
-      type: kind === 'refund' ? 'refund' : (source === 'Stripe' ? 'charge' : 'payment'),
-      product: product, orderId: '', method: method,
-      gross: gross, fee: fee, net: net, payoutId: payoutId, payoutDate: date,
-    };
-  };
-
-  // ---- サンプル取引（4月始まり年度：FY2025=2025/4〜2026/3, FY2026=2026/4〜） ----
-  const byMonth = {
-    '2025-05': [
-      T('Stripe', 's1', D(2025, 5, 3), 'sale', 'オンライン講座A', 'カード(visa)', 12000, 428, 11572, 'po_2505'),
-      T('Komoju', 'k1', D(2025, 5, 6), 'sale', '書籍セットB', 'コンビニ', 4800, 175, 4625, 'komoju'),
-    ],
-    '2025-11': [
-      T('Stripe', 's2', D(2025, 11, 4), 'sale', 'グッズC', 'カード(visa)', 3000, 107, 2893, 'po_2511'),
-      T('Stripe', 's3', D(2025, 11, 20), 'sale', 'オンライン講座A', 'カード(mastercard)', 12000, 428, 11572, 'po_2511'),
-      T('Komoju', 'k2', D(2025, 11, 10), 'sale', 'オンライン講座A', '銀行振込', 12000, 438, 11562, 'komoju'),
-    ],
-    '2026-02': [
-      T('Stripe', 's4', D(2026, 2, 8), 'sale', '書籍セットB', 'カード(visa)', 4800, 171, 4629, 'po_2602'),
-      T('Stripe', 's5', D(2026, 2, 9), 'refund', '書籍セットB', 'カード(visa)', -4800, 0, -4800, 'po_2602'),
-    ],
-    '2026-05': [
-      T('Stripe', 's6', D(2026, 5, 3), 'sale', 'オンライン講座A', 'カード(visa)', 12000, 428, 11572, 'po_2605'),
-      T('Komoju', 'k3', D(2026, 5, 7), 'sale', 'グッズC', 'PayPay', 3000, 110, 2890, 'komoju'),
-    ],
-  };
-
-  const payoutsByMonth = {
-    '2025-05': [P('po_2505', D(2025, 5, 15), 11572)],
-    '2025-11': [P('po_2511', D(2025, 11, 15), 2893 + 11572)],
-    '2026-02': [P('po_2602', D(2026, 2, 15), 4629 - 4800)],
-    '2026-05': [P('po_2605', D(2026, 5, 15), 11572)],
-  };
-
-  Object.keys(byMonth).forEach(function (ym) {
-    upsertLedger_(ss, byMonth[ym], ym, ['Stripe', 'Komoju']);
-    upsertPayoutLedger_(ss, payoutsByMonth[ym] || [], ym, ['Stripe', 'Komoju']);
-  });
-
-  regenerateReports();
-  ss.toast('サンプル（2年度・複数事業）を作成しました。各シートをご確認ください。', '完了', 6);
-}
-
-/** サンプル用の payout（calculatedNet は入金額と一致させておく） */
-function P(payoutId, arrival, amount) {
-  return {
-    source: 'Stripe', payoutId: payoutId, arrivalDate: arrival,
-    payoutAmount: amount, calculatedNet: amount, status: 'paid',
-  };
 }
 

@@ -6,7 +6,7 @@
  *
  * 流れ:
  *   月次実行 → その月の取引を取得 → 台帳（明細DB/入金DB）へ追記・更新
- *          → 台帳全体から 年度サマリー・事業別・商品別・決済手段別・入金照合 を再生成
+ *          → 台帳全体から 年度サマリー・事業別・商品別・決済手段別・入金照合・提出用明細 を再生成
  */
 
 function onOpen() {
@@ -15,7 +15,7 @@ function onOpen() {
     .addItem('① APIキー・年度開始月を設定', 'setupApiKeys')
     .addItem('② 事業マッピングを編集', 'openMappingSheet')
     .addItem('②-2 KomojuにWixの商品名を反映（自動）', 'applyWixNamesToKomoju')
-    .addItem('②-3 Komojuを仕分ける（手動・保険用）', 'openKomojuAssign')
+    .addItem('②-3 Komojuを仕分ける（手動）', 'openKomojuAssign')
     .addSeparator()
     .addItem('③ 先月分を取得して反映', 'runLastMonthReport')
     .addItem('④ 月を指定して取得', 'runReportForChosenMonth')
@@ -24,266 +24,7 @@ function onOpen() {
     .addSeparator()
     .addItem('⑥ 毎月の自動取得をON（毎月5日）', 'createMonthlyTrigger')
     .addItem('　 自動取得をOFF', 'deleteMonthlyTrigger')
-    .addSeparator()
-    .addItem('🔍 Komoju接続テスト', 'testKomoju')
-    .addItem('🔍 Komoju精算(入金)データを調べる（診断）', 'testKomojuSettlements')
-    .addItem('🔍 Stripe接続テスト', 'testStripe')
-    .addItem('🔍 Wix接続＆注文一致テスト', 'testWix')
-    .addItem('🔍 Wix注文を書き出す（診断）', 'dumpWixDiagnostic')
-    .addItem('🔍 Wixイベントを調べる（診断）', 'testWixEvents')
-    .addItem('🔍 Wixイベント購入データを調べる（診断）', 'testWixPurchases')
-    .addItem('🔍 Wix支払い/フォームを調べる（診断）', 'testWixPayments')
-    .addItem('🔍 Wix取引とKomojuを並べる（診断）', 'dumpWixTransactions')
-    .addItem('🔍 Wix支払いのページ送りを調べる（診断）', 'testWixTxPaging')
-    .addItem('★ サンプルデータで表示を確認', 'runSampleReport')
     .addToUi();
-}
-
-/**
- * Wixイベント系APIにアクセスできるか、有力なエンドポイントを順に試して
- * 「Wixイベント診断」シートに結果（ステータスと応答）を書き出す。
- */
-function testWixEvents() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbeEvents_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wixイベント診断');
-    if (!sh) sh = ss.insertSheet('Wixイベント診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭3000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = results.map(function (r) {
-      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 3000)];
-    });
-    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = 'Wixイベントの入口を ' + results.length + ' 通り試しました。\n';
-    msg += '成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wixイベント診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/** Wixの支払い/フォーム系APIの入口を探して「Wix支払い診断」シートに書き出す。 */
-function testWixPayments() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbePayments_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix支払い診断');
-    if (!sh) sh = ss.insertSheet('Wix支払い診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = results.map(function (r) {
-      return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
-    });
-    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = '支払い/フォームの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wix支払い診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/** 過去イベントの購入者・注文データの入口を探して「Wix購入診断」シートに書き出す。 */
-function testWixPurchases() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  try {
-    const results = wixProbePurchases_();
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix購入診断');
-    if (!sh) sh = ss.insertSheet('Wix購入診断');
-    sh.clear();
-    const header = ['試した内容', 'メソッド', 'パス', 'ステータス', '応答(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    if (results.length) {
-      const rows = results.map(function (r) {
-        return [r.label, r.method, r.path, r.status, String(r.text).slice(0, 4000)];
-      });
-      sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    }
-    ss.setActiveSheet(sh);
-    const ok = results.filter(function (r) { return r.status === 200; });
-    let msg = '購入データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-    results.forEach(function (r) { msg += '・' + r.label + ' → ' + r.status + '\n'; });
-    msg += '\n詳しい応答は「Wix購入診断」シートに書き出しました。共有ください。';
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('エラー ❌\n\n' + e.message);
-  }
-}
-
-/**
- * 指定月のWix注文を「Wix診断」シートに書き出す。
- * Komojuとの正しい突き合わせ方法を設計するための調査用。
- */
-function dumpWixDiagnostic() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。「①」から設定してください。'); return; }
-  const res = ui.prompt('Wix注文の書き出し', '対象の年月を入力（例: 2026-06）', ui.ButtonSet.OK_CANCEL);
-  if (res.getSelectedButton() !== ui.Button.OK) return;
-  const m = String(res.getResponseText()).match(/^(\d{4})[-\/](\d{1,2})$/);
-  if (!m) { ui.alert('形式が不正です。例: 2026-06'); return; }
-  const y = parseInt(m[1], 10), mo = parseInt(m[2], 10);
-  const from = new Date(y, mo - 1, 1, 0, 0, 0);
-  const to = new Date(y, mo, 0, 23, 59, 59);
-
-  try {
-    const all = wixListOrdersDescUntil_(from);
-    const orders = all.filter(function (o) {
-      const d = new Date(o.createdDate);
-      return d.getTime() >= from.getTime() && d.getTime() <= to.getTime();
-    });
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName('Wix診断');
-    if (!sh) sh = ss.insertSheet('Wix診断');
-    sh.clear();
-    const header = ['注文番号', '注文ID', '作成日', '合計金額', '商品名', '生データ(先頭4000字)'];
-    sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
-    const rows = orders.map(function (o) {
-      return [o.number, o.id, o.createdDate, wixTotal_(o), wixOrderProductLabel_(o),
-        JSON.stringify(o).slice(0, 4000)];
-    });
-    if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    ss.setActiveSheet(sh);
-    ui.alert(orders.length + ' 件のWix注文を「Wix診断」シートに書き出しました。\n' +
-      'このシートを（Komoju明細とあわせて）共有いただければ、正しい紐付けを作ります。');
-  } catch (e) {
-    ui.alert('Wix注文の取得エラー ❌\n\n' + e.message);
-  }
-}
-
-/**
- * Wix への接続確認。Wixの注文を取得し、台帳のKomoju注文コードと
- * 一致するか（＝商品名を補えるか）を確認する。
- */
-function testWix() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) {
-    ui.alert('Wixの APIキー / サイトID が未設定です。「①」から設定してください。');
-    return;
-  }
-  try {
-    let msg = 'Wix 接続OK ✅\n';
-
-    // 台帳のKomojuコードで、Wixの注文を「直接1件取得」できるか試す（これが本番と同じ方式）
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
-    if (!komoju.length) {
-      msg += '\n台帳にKomojuデータがありません。先に「④」でKomojuのある月を取得してください。';
-      ui.alert(msg);
-      return;
-    }
-
-    const tryCount = Math.min(komoju.length, 8);
-    let ok = 0;
-    const samples = [];
-    for (let i = 0; i < tryCount; i++) {
-      const code = String(komoju[i].orderId || komoju[i].product);
-      const order = wixGetOrderById_(code);
-      if (order) {
-        ok++;
-        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → ' + (wixOrderProductLabel_(order) || '(商品名なし)'));
-      } else {
-        if (samples.length < 4) samples.push('  ' + code.slice(0, 8) + '… → 見つからず');
-      }
-    }
-    msg += '\nKomojuコードでWix注文を取得できた数: ' + ok + ' / ' + tryCount + ' 件（試行）\n';
-    msg += samples.join('\n');
-    if (ok === 0) {
-      msg += '\n\n→ Komojuのコードは Wix の注文ID とは別物のようです。' +
-        '別の突き合わせ方法（注文番号や金額＋日付）を検討します。結果を共有してください。';
-    } else {
-      msg += '\n\n→ 取得できています！「④」で対象月を取り直すと、Komojuに商品名が入ります。';
-    }
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('Wix 接続エラー ❌\n\n' + e.message +
-      '\n\nAPIキー・サイトID・アカウントID・権限（Orders 読み取り）をご確認ください。');
-  }
-}
-
-/** Komoju への接続確認。件数や1件の中身を表示して原因を切り分ける。 */
-function testKomoju() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isKomojuEnabled_()) {
-    ui.alert('Komojuのキーが未設定です。「①」で非公開鍵（シークレットキー）を入れてください。');
-    return;
-  }
-  try {
-    const q = buildQuery_([['per_page', 5], ['limit', 5], ['page', 1]]);
-    const json = httpGetJson_(KOMOJU_BASE + '/payments?' + q, komojuHeaders_());
-    const data = json.data || [];
-    let msg = 'Komoju 接続OK ✅\n';
-    msg += '登録されている決済の総件数: ' + (json.total != null ? json.total : '不明') + '\n';
-    msg += '取得できたサンプル: ' + data.length + ' 件\n';
-    if (data.length) {
-      const p = data[0];
-      msg += '\n［最新1件の中身］\n';
-      msg += '日付: ' + (p.created_at || p.captured_at || '?') + '\n';
-      msg += '金額: ' + p.amount + ' 円\n';
-      msg += 'ステータス: ' + p.status + '\n';
-      msg += '決済手段: ' + (p.payment_details && p.payment_details.type) + '\n';
-      msg += '商品/説明: ' + (p.description || p.external_order_num || '(なし)');
-    } else {
-      msg += '\n※ 決済が0件です。テスト環境の店舗キーになっていないかご確認ください。';
-    }
-    ui.alert(msg);
-  } catch (e) {
-    ui.alert('Komoju 接続エラー ❌\n\n' + e.message +
-      '\n\nキーの種類（非公開鍵か）・店舗が正しいかご確認ください。');
-  }
-}
-
-/** Komojuの精算（入金/振込）データの入口を探して「Komoju精算診断」に書き出す。 */
-function testKomojuSettlements() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isKomojuEnabled_()) { ui.alert('Komojuのキーが未設定です。'); return; }
-  const results = komojuProbeSettlements_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName('Komoju精算診断');
-  if (!sh) sh = ss.insertSheet('Komoju精算診断');
-  sh.clear();
-  const header = ['パス', 'ステータス', '応答(先頭3500字)'];
-  sh.getRange(1, 1, 1, 3).setValues([header]).setFontWeight('bold');
-  const rows = results.map(function (r) { return [r.path, r.status, String(r.text).slice(0, 3500)]; });
-  sh.getRange(2, 1, rows.length, 3).setValues(rows);
-  ss.setActiveSheet(sh);
-  const ok = results.filter(function (r) { return r.status === 200; });
-  let msg = 'Komojuの精算データの入口を ' + results.length + ' 通り試しました。\n成功(200): ' + ok.length + ' 件\n';
-  results.forEach(function (r) { msg += '・' + r.path + ' → ' + r.status + '\n'; });
-  msg += '\n詳しい応答は「Komoju精算診断」シートに書き出しました。共有ください。';
-  ui.alert(msg);
-}
-
-/** Stripe への接続確認。 */
-function testStripe() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isStripeEnabled_()) {
-    ui.alert('Stripeのキーが未設定です。「①」で rk_live_... を入れてください。');
-    return;
-  }
-  try {
-    const json = httpGetJson_(STRIPE_BASE + '/payouts?' + buildQuery_([['limit', 3]]), stripeHeaders_());
-    const n = (json.data || []).length;
-    ui.alert('Stripe 接続OK ✅\n直近の入金(payout)を ' + n + ' 件確認できました。');
-  } catch (e) {
-    ui.alert('Stripe 接続エラー ❌\n\n' + e.message);
-  }
 }
 
 /** 先月分を取得して台帳へ反映 */
@@ -303,9 +44,7 @@ function runReportForChosenMonth() {
   runReportForMonth_(parseInt(m[1], 10), parseInt(m[2], 10));
 }
 
-/**
- * 指定した年月のデータを取得して台帳へ upsert し、全レポートを再生成。
- */
+/** 指定した年月のデータを取得して台帳へ upsert し、全レポートを再生成。 */
 function runReportForMonth_(year, month1) {
   const from = new Date(year, month1 - 1, 1, 0, 0, 0);
   const to = new Date(year, month1, 0, 23, 59, 59);
@@ -331,7 +70,7 @@ function runReportForMonth_(year, month1) {
   }
   if (isKomojuEnabled_()) {
     const k = komojuCollect_(from, to);
-    // Wixが設定されていれば、Komojuの商品名をWixの注文から補う（失敗しても本体は継続）
+    // Wixが設定されていれば、Komojuの商品名をWixの支払いデータから補う（失敗しても継続）
     try { wixEnrichKomojuTxns_(k.txns); } catch (e) { /* Wix不調時は元のコードのまま */ }
     txns = txns.concat(k.txns);
     fetchedSources.push('Komoju');
@@ -349,14 +88,13 @@ function runReportForMonth_(year, month1) {
   upsertLedger_(ss, txns, yearMonth, fetchedSources);
   upsertPayoutLedger_(ss, payouts, yearMonth, fetchedSources);
 
-  // Komojuの新しい注文コードを仕分けシートへ追記（未分類として）
+  // Komojuの新しい注文コードを仕分けシートへ追記（未補完のもののみ）
   if (fetchedSources.indexOf('Komoju') !== -1) {
     try { refreshKomojuAssign_(ss); } catch (e) { /* 継続 */ }
   }
 
   regenerateReports();
-
-  ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。台帳に蓄積されています。', '完了', 6);
+  ss.toast(yearMonth + ' 分を反映しました（取引 ' + txns.length + ' 件）。', '完了', 6);
 }
 
 /**
@@ -464,93 +202,14 @@ function regenerateReports() {
   const komojuAssign = loadKomojuAssign_(ss);
   const reports = buildReports_(txns, rules, payouts, komojuAssign);
   writeAllReports_(ss, reports);
-  // buildReports_ で product は Komoju仕分けも反映済み。その txns から提出用明細を作成
+  // buildReports_ で product・business は反映済み。その txns から提出用明細を作成
   writeSubmissionSheet_(ss, txns);
   ss.toast('レポートを再作成しました。', '完了', 4);
 }
 
-/** 支払い取引のページ送り方法を特定して「Wixページ診断」に書き出す。 */
-function testWixTxPaging() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const results = wixProbeTxPaging_();
-  let sh = ss.getSheetByName('Wixページ診断');
-  if (!sh) sh = ss.insertSheet('Wixページ診断');
-  sh.clear();
-  const header = ['試した内容', 'ステータス', '件数', 'メモ'];
-  sh.getRange(1, 1, 1, 4).setValues([header]).setFontWeight('bold');
-  const rows = results.map(function (r) { return [r.label, r.status, r.count, r.note]; });
-  sh.getRange(2, 1, rows.length, 4).setValues(rows);
-  ss.setActiveSheet(sh);
-  let msg = 'ページ送りを調べました。\n';
-  results.forEach(function (r) { msg += '・' + r.label + ' : ' + r.count + '件 ' + (r.note || '') + '\n'; });
-  msg += '\n「Wixページ診断」シートも共有ください。';
-  ui.alert(msg);
-}
-
-/** Wixの支払いデータとKomoju明細を並べて「Wix取引診断」に書き出す（原因調査用）。 */
-function dumpWixTransactions() {
-  const ui = SpreadsheetApp.getUi();
-  if (!isWixEnabled_()) { ui.alert('Wixが未設定です。'); return; }
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // 1ページ目を生取得（ページ送りの構造も見る）
-  const r = wixTry_('get', '/payments/v2/transactions?cursorPaging.limit=100', null);
-  let j = {};
-  try { j = JSON.parse(r.text); } catch (e) { }
-  const txs = j.transactions || [];
-  const meta = j.pagingMetadata || j.metadata || {};
-
-  // 台帳のKomoju明細も取得
-  const komoju = readLedger_(ss).filter(function (t) { return t.source === 'Komoju'; });
-
-  let sh = ss.getSheetByName('Wix取引診断');
-  if (!sh) sh = ss.insertSheet('Wix取引診断');
-  sh.clear();
-  const rows = [];
-  rows.push(['●メタ情報']);
-  rows.push(['status', r.status]);
-  rows.push(['取得できた取引数(1ページ)', txs.length]);
-  rows.push(['応答のキー', Object.keys(j).join(', ')]);
-  rows.push(['pagingMetadata(生)', JSON.stringify(meta).slice(0, 1500)]);
-  const dates = txs.map(function (t) { return t.createdAt; }).filter(Boolean).sort();
-  rows.push(['取引の日付範囲', (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '')]);
-  rows.push([]);
-  rows.push(['●Wix支払い（provider / 金額 / 日付JST / providerTransactionId / 商品名）']);
-  txs.forEach(function (t) {
-    rows.push([
-      t.provider,
-      t.amount ? t.amount.amount : '',
-      t.createdAt ? Utilities.formatDate(new Date(t.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') : '',
-      t.providerTransactionId || '',
-      wixTxProductName_(t),
-    ]);
-  });
-  rows.push([]);
-  rows.push(['●Komoju明細（台帳）（id / 金額 / 日付JST / 商品コード）']);
-  komoju.forEach(function (t) {
-    rows.push([
-      t.id,
-      t.gross,
-      Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM-dd'),
-      t.product,
-    ]);
-  });
-
-  // 書き込み（列数を揃える）
-  const maxc = 5;
-  const padded = rows.map(function (rw) { while (rw.length < maxc) rw.push(''); return rw.slice(0, maxc); });
-  sh.getRange(1, 1, padded.length, maxc).setValues(padded);
-  ss.setActiveSheet(sh);
-  ui.alert('「Wix取引診断」に書き出しました。\n1ページの取得数: ' + txs.length +
-    '\n日付範囲: ' + (dates[0] || '') + ' 〜 ' + (dates[dates.length - 1] || '') +
-    '\n\nこのシートを共有ください。');
-}
-
 /**
- * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する
- * （再取得なし）。金額＋日付／決済IDで突き合わせる。
+ * 台帳に既にあるKomoju明細に、Wixの支払いデータから商品名を反映する（再取得なし）。
+ * 金額＋日付／決済IDで突き合わせる。
  */
 function applyWixNamesToKomoju() {
   const ui = SpreadsheetApp.getUi();
@@ -572,13 +231,11 @@ function applyWixNamesToKomoju() {
 
   ui.alert('Wixの支払いデータと突き合わせました。\n\n' +
     '商品名を補完: ' + r.filled + ' / ' + komoju.length + ' 件\n' +
-    '　- 決済IDで一致: ' + r.byId + ' 件\n' +
-    '　- 金額＋日付で一致: ' + r.byAmt + ' 件\n' +
     '　- 未補完: ' + (komoju.length - r.filled) + ' 件\n\n' +
     '※ 未補完（同額・同日で商品を特定できない分）は「②-3 手動タグ付け」で対応できます。');
 }
 
-/** Komoju仕分けシートを開く（未分類を最新化して表示） */
+/** Komoju仕分けシートを開く（未補完のものを最新化して表示） */
 function openKomojuAssign() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const r = refreshKomojuAssign_(ss);
@@ -604,14 +261,14 @@ function setupApiKeys() {
   const props = PropertiesService.getScriptProperties();
 
   const stripe = ui.prompt('Stripe',
-    'Stripe のシークレットキー（sk_...）を入力。使わない/変更しない場合は空でOK。',
+    'Stripe のシークレットキー（sk_.../rk_...）を入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
   if (stripe.getSelectedButton() === ui.Button.OK && stripe.getResponseText().trim()) {
     props.setProperty(PROP_KEYS.STRIPE_SECRET, stripe.getResponseText().trim());
   }
 
   const komoju = ui.prompt('Komoju',
-    'Komoju のシークレットキーを入力。使わない/変更しない場合は空でOK。',
+    'Komoju のシークレットキー（非公開鍵）を入力。使わない/変更しない場合は空でOK。',
     ui.ButtonSet.OK_CANCEL);
   if (komoju.getSelectedButton() === ui.Button.OK && komoju.getResponseText().trim()) {
     props.setProperty(PROP_KEYS.KOMOJU_SECRET, komoju.getResponseText().trim());

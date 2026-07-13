@@ -246,7 +246,7 @@ function autoSize_(sh, numCols) {
  */
 function writeSubmissionSheet_(ss, txns) {
   const sh = prepSheet_(ss, SHEETS.SUBMISSION);
-  const header = ['決済サービス', '取引日', '対象月', '種別', '商品名', '売上（総額）', '手数料', '純額', '入金日'];
+  const header = ['決済サービス', '取引日', '対象月', '種別', '商品名', '事業', '売上（総額）', '手数料', '純額', '入金日'];
   sh.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold').setBackground('#e8eef7');
   sh.setFrozenRows(1);
 
@@ -258,6 +258,7 @@ function writeSubmissionSheet_(ss, txns) {
       t.yearMonth || Utilities.formatDate(t.date, 'Asia/Tokyo', 'yyyy-MM'),
       t.type,
       t.product,
+      t.business || '未分類',
       t.gross,
       t.fee,
       t.net,
@@ -266,7 +267,7 @@ function writeSubmissionSheet_(ss, txns) {
   });
   if (rows.length) {
     sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-    sh.getRange(2, 6, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
+    sh.getRange(2, 7, rows.length, 3).setNumberFormat(YEN_FMT); // 売上・手数料・純額
   }
   // 末尾の余分な空白行を削除（提出用に見た目を整える）
   const need = rows.length + 1;
